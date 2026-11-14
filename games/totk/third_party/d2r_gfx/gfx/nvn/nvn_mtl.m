@@ -3713,6 +3713,7 @@ void dm_gfx_set_flag(const char *name, int v) {
     if (!strcmp(name, "mfx_interp")) { mfx_set(v); return; }
     if (!strcmp(name, "state_reporting")) { totk_sr_set(v); return; }   // TOTK_STATE_REPORTING while playing (A/B in one session)
     if (!strcmp(name, "mfx_mv_dyn")) { mfx_set_mv_dyn(v); return; }
+    if (!strcmp(name, "present_host")) { void mtl_present_link_host(int mode); mtl_present_link_host(v ? 0 : -1); MLOG("[flag] present_host = %d (the frontend's wish for the present thread, until the frontend next publishes its own)", v != 0); return; }   // tests the switch between the display link and the present thread
     if (!strcmp(name, "link_pause")) { void mtl_link_pause(int on); mtl_link_pause(v); MLOG("[flag] link_pause = %d (the display link stops calling back, as when the system stalls it)", v != 0); return; }   // tests the display-link rescue
     if (!strcmp(name, "vr_res")) {   // VR settings without the panel (tests): 0 1344x1408, 1 1680x1760, 2 1920x2048, 3 2048x2208
         static const int sz[4][2] = { { 1344, 1408 }, { 1680, 1760 }, { 1920, 2048 }, { 2048, 2208 } };
@@ -20969,7 +20970,11 @@ __attribute__((weak)) uint64_t dm_focus_in_since(void) { return 0; }
     pthread_cond_broadcast(&g_link_cv);
     pthread_mutex_unlock(&g_link_mu);
     pthread_mutex_lock(&g_pq_mu);
-    if (!g_dm_present_link || g_pq_read == g_pq_in) { pthread_mutex_unlock(&g_pq_mu); return; }
+    /* Mode 0 no longer makes the callback return here: while this display link is attached it owns the layer and the
+       present thread waits (g_link_owns_layer), so a frame queued between the switch to mode 0 and link_sync's
+       teardown had nobody to take it, and a game thread already in mtl_present_wait for it waited for good (the
+       link kept ticking, so the stall fallback never fired). The link's last ticks before its teardown take them. */
+    if (g_pq_read == g_pq_in) { pthread_mutex_unlock(&g_pq_mu); return; }
     uint64_t first = g_pq_read + 1, ticket = g_pq_in;
     pq_item *ip = &g_pq[(g_pq_in - 1) % PQ];
     int interp = ip->interp >= 0 && !ip->interp_shown ? ip->interp : -1;   // TOTK_MFX: this tick shows the interpolated frame, a later one the game frame
@@ -21020,6 +21025,18 @@ static CAFrameRateRange link_range(int mode) {
     if (hz < 30) hz = 60; else if (hz > 240) hz = 240;
     return CAFrameRateRangeMake(hz, hz, hz);
 }
+/* The frontend's wish for the present thread (mode 0) over the display link: a variable refresh display follows a
+   full-screen window's drawables only when they are presented as they are ready, which the display link's fixed rate
+   never does (measured 2026-11-13: an LG G3 with the game capped at 120 and
+   running at 115 fps held 9.6% of the pictures for a second refresh with the link and 0.02% with the present
+   thread). The wish is only published here. link_sync applies it on the game thread, between two frames, for as
+   long as it stands: not during a rescue (which borrows mode 0 and whose end hands the mode back, after which the
+   wish is applied again in the same call) and not under the 30 fps power-saving link. The teardown it leads to
+   finishes later, on the link's thread, and until then the link still owns the layer and its callback keeps taking
+   the queued frames (see the delegate). When the wish ends the mode goes back to what it was when the wish began.
+   -1: no wish. */
+static _Atomic int g_present_link_host = -1;
+void mtl_present_link_host(int mode) { atomic_store(&g_present_link_host, mode == 0 ? 0 : -1); }
 static int g_link_mode = 1;   // 节拍对象当前的模式：1 / 2 同 g_dm_present_link，3 = 省电模式 30 Hz | Current mode of the display link object: 1 / 2 same as g_dm_present_link, 3 = power-saving mode 30 Hz
 static void *link_main(void *arg) {   // 显示节拍线程：切到节拍模式时起，切回 0 时退出 | Display link thread: started when switching to display-link mode, exits when switching back to 0
     (void)arg;
@@ -21043,14 +21060,36 @@ static void link_sync(void) {   // 游戏出图线程每帧调：把节拍对象
     if (g_rescue_mode && now_ns() >= g_rescue_back_at) {   // rescue period over: back to the display link (stall timing starts afresh)
         pthread_mutex_lock(&g_pq_mu); g_dm_present_link = g_rescue_mode; g_rescue_mode = 0; g_stall_t0 = 0; g_link_tick_ns = now_ns(); pthread_mutex_unlock(&g_pq_mu);
         MLOG("显示节拍：抢救期满，换回节拍模式 %d 再试（帧 %llu）", g_dm_present_link, (unsigned long long)atomic_load(&g_cur_frame)); }
+    if (!g_rescue_mode) {   /* the frontend's wish (mtl_present_link_host); a rescue has the mode until it ends */
+        static int host_on, host_saved;
+        int host = atomic_load(&g_present_link_host) == 0 && mtl_fps_target() != 30;
+        if (host && (!host_on || g_dm_present_link)) {   /* the wish begins, or something else wrote the mode since */
+            pthread_mutex_lock(&g_pq_mu);
+            if (!host_on) host_saved = g_dm_present_link;
+            g_dm_present_link = 0;
+            pthread_mutex_unlock(&g_pq_mu);
+            if (!host_on) MLOG("present mode: the present thread, as the frontend asked (full screen on a variable refresh display; frame %llu)", (unsigned long long)atomic_load(&g_cur_frame));
+            host_on = 1;
+        } else if (!host && host_on) {
+            pthread_mutex_lock(&g_pq_mu); g_dm_present_link = host_saved; pthread_mutex_unlock(&g_pq_mu);
+            host_on = 0;
+            MLOG("present mode: back to mode %d (the frontend's wish ended, or the 30 fps link took over; frame %llu)", host_saved, (unsigned long long)atomic_load(&g_cur_frame));
+        }
+    }
     int want = g_dm_present_link;
     if (want < 0 || want > 2) { g_dm_present_link = applied == 3 ? 1 : applied; return; }
     if (want && mtl_fps_target() == 30) want = 3;   // 省电模式：显示节拍 30 Hz | Power-saving mode: display link at 30 Hz
-    if (want == applied) return;
+    /* Mode 0 with a link thread started is not settled even when the last applied mode was 0: the start leaves
+       `applied` as it was until a later call finds the link object, and a switch to 0 in between returned here,
+       leaving the new link attached with nobody presenting. That link is still to be taken down below. */
+    if (want == applied && !(!want && g_link_started)) return;
     g_link_mode = want;
     if (!g_link_started) {
         if (!want) { applied = 0; return; }
         if (!front_metal_layer()) return;
+        /* The stall clock starts afresh with a new link, as at the end of a rescue: after minutes in mode 0 the last
+           tick's time is that old, and a first tick 100 ms late read as a stall that long (a rescue at once). */
+        pthread_mutex_lock(&g_pq_mu); g_stall_t0 = 0; g_link_tick_ns = now_ns(); pthread_mutex_unlock(&g_pq_mu);
         g_link_started = 1; pthread_t th; if (pthread_create(&th, NULL, link_main, NULL)) MDIE("显示节拍线程起不来"); pthread_detach(th);
         return;   // 节拍对象在新线程里建，下一帧再对齐 | The display link object is created on a new thread; align again next frame
     }

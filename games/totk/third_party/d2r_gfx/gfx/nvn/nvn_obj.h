@@ -433,6 +433,7 @@ uint64_t mtl_udc_saved_bytes(void);                                      // DM_N
 int mtl_has_window(void);
 int mtl_warm_wait(int timeout_ms);
 int mtl_link_active(void);
+void mtl_present_link_host(int mode);   /* a frontend's wish for the present thread: 0 = wanted, anything else = no wish (nvn_mtl.m link_sync) */
 /* frame_ticks: 60 Hz ticks one game frame occupies (the game's present interval; 1 in display mode). */
 int mtl_link_wait_tick(uint64_t timeout_ns, unsigned frame_ticks);
 double mtl_presented_time(uint64_t n);
