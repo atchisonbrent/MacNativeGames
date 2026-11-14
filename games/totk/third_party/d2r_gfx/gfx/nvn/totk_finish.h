@@ -10,6 +10,7 @@
 //   the 3D picture is sharpened and the UI drawn later is not.
 // - FXAA Quality / SMAA: optional spatial replacements on the pre-FXAA picture. All resources are prepared before
 //   skipping the game's draw; a failed prepare keeps the game's FXAA, a failed encode copies the source picture.
+//   With sharpening, TOTK_FINISH_DIRECT (default 1) routes AA through scratch and RCAS into the final image, without a blit.
 //   The Effects page selects method and quality independently (totk_aa_config.h), with the game's FXAA as the default.
 // Each method can be sharpened before upscaling and the UI (graphics-sharpen.txt; "flag fxaa_off <0|1>",
 // "flag sharpen_pct <0..100>"). Only a plain full-screen FXAA draw is taken (one colour target, no blending, the whole
@@ -60,22 +61,75 @@ static id<MTLRenderPipelineState> fin_ps(MTLPixelFormat f, int pct) {
     g_fin.ps[slot] = ps; g_fin.ps_fmt[slot] = f; g_fin.ps_pct[slot] = pct;
     return ps;
 }
-/* One full-screen pass: in -> out (out's whole area). */
-static int fin_pass(id<MTLTexture> in, id<MTLTexture> out, int pct) {
-    id<MTLRenderPipelineState> ps = fin_ps(out.pixelFormat, pct); if (!ps) return 0;
+static int fin_direct_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("TOTK_FINISH_DIRECT"); on = !(e && !strcmp(e, "0")); }
+    return on;
+}
+/* Prepare all fallible resources before routing replacement AA away from dst. */
+static id<MTL4ArgumentTable> fin_args(void) {
     int s = g_fin.slot = (g_fin.slot + 1) % 3;
     if (!g_fin.args[s]) { MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new]; ad.maxTextureBindCount = 1; NSError *e = nil;
-                          if (!(g_fin.args[s] = [g_dev newArgumentTableWithDescriptor:ad error:&e])) return 0; }
+                          g_fin.args[s] = [g_dev newArgumentTableWithDescriptor:ad error:&e]; }
+    return g_fin.args[s];
+}
+static MTL4RenderPassDescriptor *fin_target(id<MTLTexture> out) {
     MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
     rp.colorAttachments[0].texture = out; rp.colorAttachments[0].loadAction = MTLLoadActionDontCare; rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    return rp;
+}
+/* One full-screen pass with prepared resources; the encoder itself can still fail. */
+static int fin_encode(id<MTLTexture> in, MTL4RenderPassDescriptor *rp, id<MTLRenderPipelineState> ps, id<MTL4ArgumentTable> args) {
     id<MTL4RenderCommandEncoder> re = [g_cb renderCommandEncoderWithDescriptor:rp];
+    if (!re) return 0;
     [re barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageFragment visibilityOptions:MTL4VisibilityOptionDevice];
-    [g_fin.args[s] setTexture:in.gpuResourceID atIndex:0];
-    [re setArgumentTable:g_fin.args[s] atStages:MTLRenderStageFragment];
+    [args setTexture:in.gpuResourceID atIndex:0];
+    [re setArgumentTable:args atStages:MTLRenderStageFragment];
+    id<MTLTexture> out = rp.colorAttachments[0].texture;
     [re setViewport:(MTLViewport){0, 0, (double)out.width, (double)out.height, 0, 1}];
     [re setRenderPipelineState:ps];
     [re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [re endEncoding];
+    return 1;
+}
+static int fin_pass(id<MTLTexture> in, id<MTLTexture> out, int pct) {
+    id<MTLRenderPipelineState> ps = fin_ps(out.pixelFormat, pct); if (!ps) return 0;
+    id<MTL4ArgumentTable> args = fin_args(); if (!args) return 0;
+    MTL4RenderPassDescriptor *rp = fin_target(out); if (!rp) return 0;
+    return fin_encode(in, rp, ps, args);
+}
+static id<MTLTexture> fin_scratch(id<MTLTexture> dst) {
+    if (!g_fin.scratch || g_fin.scratch.width != dst.width || g_fin.scratch.height != dst.height || g_fin.scratch.pixelFormat != dst.pixelFormat) {
+        if (g_fin.scratch) defer_obj_release(g_fin.scratch);
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:dst.pixelFormat width:dst.width height:dst.height mipmapped:NO];
+        td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead; td.storageMode = MTLStorageModePrivate;
+        g_fin.scratch = [g_dev newTextureWithDescriptor:td]; if (g_fin.scratch) res_add(g_fin.scratch);
+    }
+    return g_fin.scratch;
+}
+/* Same AA and RCAS format rounding, reversed destinations. Scratch is private to
+ * this helper: no later draw expects it to contain the sharpened picture.
+ * Both AA encoders fully overwrite a RenderTarget, then RCAS needs ShaderRead;
+ * neither needs ShaderWrite (even when dst is an FP16 HDR companion). */
+static int fin_direct(id<MTLTexture> src, id<MTLTexture> dst, int pct) {
+    id<MTLTexture> scratch = fin_scratch(dst); if (!scratch || scratch == src || scratch == dst) return 0;
+    id<MTLRenderPipelineState> ps = fin_ps(dst.pixelFormat, pct); if (!ps) return 0;
+    id<MTL4ArgumentTable> args = fin_args(); if (!args) return 0;
+    MTL4RenderPassDescriptor *rp = fin_target(dst); if (!rp) return 0;
+    int smoothed = g_fin.smaa && smaa_encode(g_cb, src, scratch, g_fin.smaa_slot);
+    if (!smoothed && g_fin.fxaa_quality) smoothed = fxaa_quality_encode(g_cb, src, scratch, g_fin.smaa_slot);
+    /* Failed AA retains today's source -> dst sharpening fallback. Never read
+     * scratch unless AA completed, including SMAA's final blend pass. */
+    if (fin_encode(smoothed ? scratch : src, rp, ps, args)) {
+        hdr_shadow_external(dst);
+        return 1;
+    }
+    if (!smoothed) return 0;   // retry today's route; dst has not been written
+    /* A late encoder failure must not strand the only valid AA image in scratch.
+     * Preserve it in dst without sharpening, as when legacy fin_pass fails. */
+    id<MTL4ComputeCommandEncoder> b = blit(); if (!b) return 0;   // let the legacy route retry instead of publishing an unwritten dst
+    enc_b_copy_texture(b, scratch, 0, 0, MTLOriginMake(0, 0, 0), MTLSizeMake(dst.width, dst.height, 1), dst, 0, 0, MTLOriginMake(0, 0, 0));
+    blit_close(); hdr_shadow_external(dst);
     return 1;
 }
 /* The first texture this draw's fragment shader reads (FXAA reads one). */
@@ -117,23 +171,19 @@ static int fin_draw(__unsafe_unretained NvShader *fs) {
     rp_end(); blit_close(); rs_sync();
     pt_mark(g_cb, 'F', nil);
     id<MTLTexture> src = g_fin.src, dst = g_fin.dst; g_fin.src = nil; g_fin.dst = nil;
+    if (fin_direct_on() && pct && (g_fin.smaa || g_fin.fxaa_quality) && fin_direct(src, dst, pct)) goto done;
     hdr_shadow_external(dst);
     int smoothed = g_fin.smaa && smaa_encode(g_cb,src,dst,g_fin.smaa_slot);
     if(!smoothed&&g_fin.fxaa_quality)smoothed=fxaa_quality_encode(g_cb,src,dst,g_fin.smaa_slot);
     if (g_fin.skipped && !smoothed) fin_pass(src, dst, pct);   // FXAA off, or SMAA failed: a valid picture in either case
     if (pct && (!g_fin.skipped || smoothed)) {   // FXAA / SMAA kept: its image sharpened through a scratch image of its size
-        if (!g_fin.scratch || g_fin.scratch.width != dst.width || g_fin.scratch.height != dst.height || g_fin.scratch.pixelFormat != dst.pixelFormat) {
-            if (g_fin.scratch) defer_obj_release(g_fin.scratch);
-            MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:dst.pixelFormat width:dst.width height:dst.height mipmapped:NO];
-            td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead; td.storageMode = MTLStorageModePrivate;
-            g_fin.scratch = [g_dev newTextureWithDescriptor:td]; if (g_fin.scratch) res_add(g_fin.scratch);
-        }
-        if (g_fin.scratch && fin_pass(dst, g_fin.scratch, pct)) {
+        if (fin_scratch(dst) && fin_pass(dst, g_fin.scratch, pct)) {
             id<MTL4ComputeCommandEncoder> b = blit();
             enc_b_copy_texture(b, g_fin.scratch, 0, 0, MTLOriginMake(0, 0, 0), MTLSizeMake(dst.width, dst.height, 1), dst, 0, 0, MTLOriginMake(0, 0, 0));
             blit_close();
         }
     }
+done:
     if (!g_fin.done++) MLOG("[fxaa] FXAA %s，锐化 %d%%（%lux%lu）", g_fin.skipped ? "关" : "开", pct, (unsigned long)dst.width, (unsigned long)dst.height);
     return 0;
 }
