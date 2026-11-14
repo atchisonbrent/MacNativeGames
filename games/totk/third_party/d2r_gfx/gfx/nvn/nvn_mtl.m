@@ -17075,6 +17075,62 @@ static void scene_size_note(__unsafe_unretained NvShader *fs) {   // the compose
     if (ow != w || oh != h) hdr_shadow_invalidate_all();
     if (ow != w || oh != h) MLOG("内部分辨率（合成采样的场景）：%ux%u", w, h);
 }
+/* TOTK_SCENE_HOLD (scene_hold.h): which game frames ran the compose pass, and which drew a picture of their own across
+   the canvas the scene ends on. A backdrop is a draw on that canvas whose first texture is a 16:9 picture in a render
+   format, at least 1024 wide: the HUD's widgets are the game's art and small pictures (the minimap, 384x384; a 640x360
+   one). Where a menu's still is smaller than that, the frame and time limits end the hold instead. TOTK_SCENE_HOLD_LOG=1 lists the pictures looked at. Frame number + 1, so 0 is never a frame. Default: 8 frames on Breath of the Wild, off elsewhere; TOTK_SCENE_HOLD=<frames> sets it, 0 is off. */
+#include "scene_hold.h"
+#define SCENE_HOLD_MS 100   /* and no longer than this: eight frames are 73 ms at 110 frames a second, 267 ms at 30 */
+static _Atomic uint64_t g_hold_scene[64], g_hold_backdrop[64];   // by frame & 63: the present reads a frame's entry a few frames after the draw side wrote it (the present queue is 8 deep), long before the frame 64 later overwrites it
+static uint64_t g_hold_canvas;   // serial of the canvas: the target of the game's last scene draw (game thread)
+static int g_hold_canvas_final;   // ... which is Breath of the Wild's FXAA / upscale draw once that has been seen, the compose pass until then
+static int scene_hold_limit(void) {
+    static _Atomic int set = -1;   // read on the draw side and at the present
+    int v = atomic_load_explicit(&set, memory_order_relaxed);
+    if (v < 0) { const char *e = getenv("TOTK_SCENE_HOLD");
+#ifdef GAME_BOTW
+        v = e && *e ? atoi(e) : 8;
+#else
+        v = e && *e ? atoi(e) : 0;
+#endif
+        if (v < 0) v = 0; if (v > 30) v = 30;
+        int was = -1;
+        if (atomic_compare_exchange_strong(&set, &was, v) && v) MLOG("[scene-hold] a picture without its scene is held back for up to %d frames or %d ms (TOTK_SCENE_HOLD=0: shown as drawn)", v, SCENE_HOLD_MS); }
+    return v;
+}
+static int scene_hold_log(void) { static _Atomic int v = -1; int x = atomic_load_explicit(&v, memory_order_relaxed); if (x < 0) { x = getenv("TOTK_SCENE_HOLD_LOG") != NULL; atomic_store(&v, x); } return x; }
+static void scene_hold_note(__unsafe_unretained NvShader *fs) {   // submit thread (replays are serialized): the statics below are its own
+    if (!scene_hold_limit() || !R.rt.n || !R.rt.color[0]) return;
+    uint64_t f = atomic_load(&g_cur_frame);
+    if (TAA_COMPOSE(fs)) { if (!g_hold_canvas_final) g_hold_canvas = R.rt.color[0]->serial; atomic_store(&g_hold_scene[f & 63], f + 1); return; }
+#ifdef BOTW_MFXUP_KEY
+    if (!strncmp(fs->key, BOTW_MFXUP_KEY, 65)) { g_hold_canvas = R.rt.color[0]->serial; g_hold_canvas_final = 1; return; }   // compose writes a target of its own; this draw writes the canvas the HUD and the menus go on
+#endif
+    if (R.rt.color[0]->serial != g_hold_canvas || atomic_load(&g_hold_backdrop[f & 63]) == f + 1) return;
+    int tid = 0;   // the first texture this shader declares: a slot it does not read may still hold an earlier draw's texture
+    for (int i = 0; i < fs->rf.nb; i++) if (fs->rf.b[i].kind == NVN_RB_TEX && fs->rf.b[i].reg < 128) { tid = (int)(S.tex[1][fs->rf.b[i].reg] & 0xfffff); break; }
+    if (tid <= 0) return;
+    static uint64_t seen_f; static int seen[4], nseen;   // the HUD's draws share a few textures: each is looked at once a frame
+    if (seen_f != f) { seen_f = f; nseen = 0; }
+    for (int i = 0; i < nseen; i++) if (seen[i] == tid) return;
+    if (nseen < 4) seen[nseen++] = tid;
+    id<MTLTexture> src = (__bridge id<MTLTexture>)tex_fast_lk(tid);
+    if (!src) return;
+    MTLPixelFormat pf = src.pixelFormat;   // a picture the game rendered, not its art: the sampled view has lost the render-target usage, so the format says it
+    if (pf != MTLPixelFormatRGB10A2Unorm && pf != MTLPixelFormatRGBA8Unorm && pf != MTLPixelFormatRGBA8Unorm_sRGB && pf != MTLPixelFormatBGRA8Unorm &&
+        pf != MTLPixelFormatBGRA8Unorm_sRGB && pf != MTLPixelFormatRG11B10Float && pf != MTLPixelFormatRGBA16Float) return;
+    long off = (long)src.width * 9 - (long)src.height * 16; if (off < 0) off = -off;
+    if (off * 50 > (long)src.width * 9) return;   // not 16:9 within 2%
+    /* Measured on 1.9.0 (2026-11-14): the weapon wheel's still of the scene is 1280x720 whatever the canvas (1920x1080,
+       2560x1440, 3840x2160), the pause menu's is the canvas's size; the pictures drawn in the frames without a scene
+       too are 640x360 (wheel) and 320x180 (pause menu). */
+    int is = src.width >= 1024;
+    static int shown; int lg = scene_hold_log();
+    if ((is && shown < 4) || (lg && shown < 64)) { shown++; MLOG("[scene-hold] frame %llu: a %lux%lu picture (format %lu) on the %ux%u canvas: %s", (unsigned long long)f,
+        (unsigned long)src.width, (unsigned long)src.height, (unsigned long)pf, R.rt.color[0]->d.width, R.rt.color[0]->d.height, is ? "a menu's still, shown" : "too small to be one"); }
+    if (!is) return;
+    atomic_store(&g_hold_backdrop[f & 63], f + 1);
+}
 #include "totk_finish.h"   // FXAA off and sharpening (the settings panel's effects page)
 #if defined(GAME_BOTW190) && !TARGET_OS_IPHONE   // Mac only: the iOS settings have no FXAA / sharpening rows (after PR #1637)
 #define BOTW_FINISH 1
@@ -17087,6 +17143,7 @@ static int mfxup_draw(NvProg *pr) {
     __unsafe_unretained NvShader *fs = pr->sh[1];
     if (!fs) return 0;
     scene_size_note(fs);
+    scene_hold_note(fs);
     if (fin_draw(fs)) return 1;   // FXAA off: our pass writes its image before the reader (totk_finish.h)
 #ifdef BOTW_FINISH
     botw_fin_before(fs);   // the canvas sharpened before the first draw after the scene that writes or reads it (botw_finish.h)
@@ -20567,6 +20624,18 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     if (interp >= 0) { double now = CACurrentMediaTime(); fps_overlay_note_gen(++g_gen_shown, now); fps_board_note_gen(now); atomic_store(&g_mfxi_last, frame ? frame : 1); }
     else { double now = CACurrentMediaTime(); fps_overlay_note(ticket, now); fps_board_note(ticket, now); }
     if (g_use != USE_OFF && g_use != USE_DONE) use_tick();
+    /* TOTK_SCENE_HOLD (scene_hold.h): this frame has no scene and follows one that had: it is not shown, and the last
+       picture stays up. It leaves by the path that takes no drawable (below), before the layer's format is looked at:
+       such a frame has no HDR picture either, and would switch the surface to SDR and back. */
+    int scene_held = 0;
+    if (interp < 0 && scene_hold_limit()) {
+        static SceneHold hold; static uint64_t runs, frames, since;   // one presenter at a time (g_pq_mu hands the queue to the present thread or the display link's)
+        int was = hold.held, lim = scene_hold_limit();
+        if (was && now_ns() - since > SCENE_HOLD_MS * 1000000ull) lim = was;   // held long enough: this one is shown whatever it is
+        scene_held = scene_hold_step(&hold, atomic_load(&g_hold_scene[frame & 63]) == frame + 1, atomic_load(&g_hold_backdrop[frame & 63]) == frame + 1, lim);
+        if (scene_held && !was) since = now_ns();
+        if (scene_held) { frames++; if (!was && (++runs <= 3 || runs % 50 == 0)) MLOG("[scene-hold] frame %llu has no scene: the last picture stays (%llu times so far, %llu frames)", (unsigned long long)frame, (unsigned long long)runs, (unsigned long long)frames); }
+    }
     if (bootprof() && (g_present_n == 1 || g_present_n % 120 == 0)) {
         if (g_present_n == 1) g_bp_first_present = bp_now() - g_bp_t0;
         MLOG("[bootprof] t=%.3f s 出图第 %llu 次：metallib 载入 %llu 个 / %.1f ms；管线创建 %llu 个 / %.1f ms（均在提交线程同步）；预热领用 着色器 %llu / 渲染管线 %llu / 计算管线 %llu；"
@@ -20654,7 +20723,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     if (rl < 0) { const char *e = getenv("DM_NVN_REGLUM"), *c = e ? strchr(e, ':') : NULL;
         rl = c && sscanf(e, "%f,%f,%f,%f", &rr[0], &rr[1], &rr[2], &rr[3]) == 4 && (rlf = fopen(c + 1, "w")) != NULL;
         if (e && !rl) MLOG("【红】DM_NVN_REGLUM 参数或文件无效：%s", e); }
-    if (rl && (src.pixelFormat == MTLPixelFormatRGBA8Unorm || src.pixelFormat == MTLPixelFormatBGRA8Unorm || src.pixelFormat == MTLPixelFormatRGBA8Unorm_sRGB || src.pixelFormat == MTLPixelFormatBGRA8Unorm_sRGB)) {
+    if (rl && !scene_held && (src.pixelFormat == MTLPixelFormatRGBA8Unorm || src.pixelFormat == MTLPixelFormatBGRA8Unorm || src.pixelFormat == MTLPixelFormatRGBA8Unorm_sRGB || src.pixelFormat == MTLPixelFormatBGRA8Unorm_sRGB)) {
         NSUInteger x0 = (NSUInteger)(rr[0] * src.width), y0 = (NSUInteger)(rr[1] * src.height), w = (NSUInteger)(rr[2] * src.width) - x0, h = (NSUInteger)(rr[3] * src.height) - y0;
         id<MTLBuffer> rb = [g_dev newBufferWithLength:w * h * 4 options:MTLResourceStorageModeShared];
         const char *hdr_dir = getenv("DM_NVN_FLASHHDR");
@@ -20755,7 +20824,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     CGSize size=layer.drawableSize;uint64_t wh=(uint64_t)(uint32_t)size.width|((uint64_t)(uint32_t)size.height<<32);
     if(atomic_exchange(&hdr_size,wh)!=wh)hdr_shadow_invalidate_all();
 #if TARGET_OS_OSX
-    if(totk_hdr_available() && front_hdr_present_mode){
+    if(totk_hdr_available() && front_hdr_present_mode && !scene_held){
         MTLPixelFormat want=hdrFrame?MTLPixelFormatRGBA16Float:MTLPixelFormatBGRA8Unorm;
         if(layer.pixelFormat!=want){mtl_finish_gpu();front_hdr_present_mode(hdrFrame);}
         /* The display link may hand a drawable of the format before the switch. It is drawn into as it is (present_pipeline
@@ -20775,12 +20844,12 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     /* TOTK: whole-window shots (wshot, TOTK_WINDOW_SHOT) copy the drawable itself after the present has drawn into it: what
        the screen shows, MetalFX output upscale and boxes included (grab_present re-renders only for TOTK_PRESENT_SKIP). */
     void (^grab)(CGImageRef) = nil; NSString *grab_src = nil;
-    if (g_grab_cb && interp < 0) { pthread_mutex_lock(&g_shotq_mu); grab = g_grab_cb; g_grab_cb = nil;
+    if (g_grab_cb && interp < 0 && !scene_held) { pthread_mutex_lock(&g_shotq_mu); grab = g_grab_cb; g_grab_cb = nil;   // a held frame is not shown: the shot waits for the next one
         if (g_grab_src_path[0]) { grab_src = @(g_grab_src_path); g_grab_src_path[0] = 0; } pthread_mutex_unlock(&g_shotq_mu); }
     /* TOTK_PRESENT_SKIP=1 (measurement only): never take a drawable, so the render pipeline's own frame rate shows (the window
        does not update). */
     static int present_skip = -1; if (present_skip < 0) { present_skip = getenv("TOTK_PRESENT_SKIP") != NULL; if (present_skip) MLOG("【实验】TOTK_PRESENT_SKIP=1：不出图，只测渲染流水线"); }
-    if (nogpu() || present_skip) {
+    if (nogpu() || present_skip || scene_held) {
         int grabbing=grab && present_skip && !nogpu();
         /* No present completion will retire the slot. An offscreen screenshot
          * still reads it asynchronously, so its callback owns that retirement. */
@@ -20788,7 +20857,9 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
             grab(img);
             if (ring>=0) { pthread_mutex_lock(&g_pq_mu);g_pring_busy[ring]=0;pthread_cond_broadcast(&g_pq_cv);pthread_mutex_unlock(&g_pq_mu); }
         },src,crop,layer.drawableSize);
-        pthread_mutex_lock(&g_pq_mu); if (ring >= 0 && !grabbing) g_pring_busy[ring] = 0; if (ticket > g_pq_done) g_pq_done = ticket; pthread_cond_broadcast(&g_pq_cv); pthread_mutex_unlock(&g_pq_mu); return 1; }
+        pthread_mutex_lock(&g_pq_mu); if (ring >= 0 && !grabbing) g_pring_busy[ring] = 0; if (ticket > g_pq_done) g_pq_done = ticket;
+        if (scene_held) g_pres[ticket % PRING] = (pres_ent){ticket, -1};   // a held frame was not shown: the statistics count it as the dropped ones
+        pthread_cond_broadcast(&g_pq_cv); pthread_mutex_unlock(&g_pq_mu); return 1; }
     uint64_t dt0 = now_ns();
     id<CAMetalDrawable> dr = supplied ? supplied : [layer nextDrawable];
     if (!supplied) g_drawable_ns += now_ns() - dt0;
