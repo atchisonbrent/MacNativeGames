@@ -8,8 +8,9 @@ FW := -framework Metal -framework MetalFX -framework Foundation -framework Quart
 WD := $(OUT)/t_gpu_watchdog
 SH := $(OUT)/t_scene_hold
 FO := $(OUT)/t_front_overlay
+LL := $(OUT)/t_late_learn
 .PHONY: all run clean hdr
-all: $(BIN) $(WD) $(SH) $(FO)
+all: $(BIN) $(WD) $(SH) $(FO) $(LL)
 # Force compilation: the backend includes headers beyond this directory.
 .PHONY: FORCE
 $(BIN): FORCE
@@ -24,8 +25,12 @@ $(SH): t_scene_hold.c ../scene_hold.h
 $(FO): t_front_overlay.c ../front_overlay.h
 	@mkdir -p $(OUT)
 	TMPDIR=$(OUT) xcrun clang -std=c11 -O1 -g -Wall -Wextra -Werror -pthread t_front_overlay.c -o $@
-run: $(BIN) $(WD) $(SH) $(FO) hdr
+$(LL): t_late_learn.c ../late_learn.h
+	@mkdir -p $(OUT)
+	TMPDIR=$(OUT) xcrun clang -std=c11 -O1 -g -Wall -Wextra -Werror t_late_learn.c -o $@
+run: $(BIN) $(WD) $(SH) $(FO) $(LL) hdr
 	@$(FO)
+	@$(LL)
 	@$(WD)
 	@$(SH)
 	@set -e; for c in stale delegate rescue holds power clock winding; do DM_PRESENT_LINK=1 $(BIN) $$c; done
@@ -50,6 +55,6 @@ hdr:
 	TMPDIR=$(OUT) xcrun clang -Wall -Wextra -Werror -DGAME_BOTW=1 -DGAME_BOTW190=1 -DTEST_HDR_NONMAC=1 -DEXPECT_HDR=0 t_hdr_gates.c -o $(OUT)/t_hdr_gates
 	TOTK_HDR=1 TOTK_HDR_CONTROL=1 $(OUT)/t_hdr_gates
 clean:
-	rm -f $(BIN) $(WD) $(SH) $(FO) $(OUT)/t_botw_hdr $(OUT)/t_hdr_gates $(OUT)/botw_hdr_twin.metal $(OUT)/botw_hdr_twin.air
+	rm -f $(BIN) $(WD) $(SH) $(FO) $(LL) $(OUT)/t_botw_hdr $(OUT)/t_hdr_gates $(OUT)/botw_hdr_twin.metal $(OUT)/botw_hdr_twin.air
 	rm -f $(HDR_SYNTHETIC_TWIN) $(OUT)/botw_hdr_synthetic_twin.air $(OUT)/botw_compose_synthetic.air
 	rm -rf $(OUT)/metal-module-cache

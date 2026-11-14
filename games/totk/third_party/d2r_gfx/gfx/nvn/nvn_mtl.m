@@ -23999,8 +23999,9 @@ void botw_tiny_commit(void) {   // in mtl_sub_commit, after the last render pass
    away, about 130 draws a frame on the Great Plateau), and also its 64x64 light-probe cube maps. The flush write-back waited for that rendering on the game's thread,
    about 3.7 ms a frame: 116-119 fps instead of 120 at the 120 cap. The game itself never waits for it (nvnSyncWait does wait
    for its fence; were there a wait, the flush would find the rendering done), so on hardware the CPU reads what the GPU
-   has finished by then. A render target the flush has had to wait for LATE_LEARN times (LATE_BYTES at most, every level and
-   layer) is learned. From then on, the end of each submission that renders it copies it out, and that submission's
+   has finished by then. A render target the flush has had to wait for often enough (LATE_BYTES at most, every level and
+   layer) is learned: in LATE_LEARN_RUN frames close together, or LATE_LEARN times in all (late_learn.h, which also says
+   what a scene's first seconds cost before the first of the two). From then on, the end of each submission that renders it copies it out, and that submission's
    completion writes it into its memory, as the water colours above; the flush frees its record without waiting, and the
    CPU reads the last completed rendering. A rendering the CPU has written over since is not written, and a finalized
    pool's pending ones are dropped (botw_late_drop). The 1 MiB mask starts and ends inside 16 KiB pages it shares with
@@ -24010,22 +24011,24 @@ void botw_tiny_commit(void) {   // in mtl_sub_commit, after the last render pass
    #764), a GPU copy into them cancels the landing (botw_gpu_copy_supersedes), and only the newest rendering of a memory
    lands. A learned target not rendered for LATE_IDLE submissions gives its slot to the next one (a recreated mask has
    a new serial).
-   TOTK_BOTW_LATE_WB=0 keeps the waiting write-back. */
+   TOTK_BOTW_LATE_WB=0 keeps the waiting write-back. TOTK_BOTW_LATE_RUN=<frames> (diagnostic) replaces LATE_LEARN_RUN;
+   0 leaves the LATE_LEARN rule alone. */
 #ifndef LATE_MAX
-#define LATE_MAX 16   /* 8 until 2026-11-14: on 1.9.0 in the open world the eight went to per-frame targets first, and the two
-                         64x64 cube maps the game renders every tenth frame (6 faces, 4 levels) never got one: the main thread
-                         waited for their rendering at each, 3 to 8 ms without HDR and 10 ms with it. Eleven are in use there. */
+#define LATE_MAX 32   /* 8, then 16, until 2026-11-14. On 1.9.0 in the open world eight went to per-frame targets first, and the
+                         two 64x64 cube maps the game renders every tenth frame (6 faces, 4 levels) never got one: the main
+                         thread waited for their rendering at each, 3 to 8 ms without HDR and 10 ms with it. Eleven were in use
+                         there with the LATE_LEARN rule alone and fifteen with LATE_LEARN_RUN, which also learns targets the
+                         flush waits for only while the others are being learned. */
 #endif
-#define LATE_LEARN 120
+#include "late_learn.h"
 #define LATE_BYTES (1u << 20)
 #define LATE_RED 123   /* RED_ONCE slot */
 #define LATE_IDLE 2000
 #define LATE_SLOTS 4
-typedef struct { uint64_t serial; unsigned waits; } late_cand;
 typedef struct { tex_t t; uint64_t stamp; size_t n; int ring, cancel; size_t hn, t0, tn; uint8_t *edge; uint64_t lseq; int busy; } late_job;   /* busy: being written into memory */   /* edge: own bytes on the head page [0, hn) and tail page [t0, t0 + tn) at the rendering; lseq: landings of its target by then */
 static pthread_mutex_t g_late_mu = PTHREAD_MUTEX_INITIALIZER;   /* candidates, learning, slots and the jobs in flight; never held while writing memory */
 static pthread_mutex_t g_late_land_mu = PTHREAD_MUTEX_INITIALIZER;   /* one submission's landings at a time (taken before g_late_mu) */
-static late_cand g_late_cand[16];
+static late_cand g_late_cand[LATE_CANDS];
 static _Atomic int g_late_n;   /* learned slots */
 static late_job g_late_sub[LATE_MAX]; static __strong id<MTLTexture> g_late_tex[LATE_MAX]; static int g_late_nsub;   /* submit thread */
 static __strong id<MTLBuffer> g_late_buf[LATE_MAX][LATE_SLOTS]; static uint64_t g_late_bfence[LATE_MAX][LATE_SLOTS];   /* submit thread: a slot per submission */
@@ -24147,13 +24150,17 @@ void botw_late_commit(void) {
 }
 /* wb_write_list (game thread): a record whose last rendering lands on completion is freed without a wait or a write-back;
    the others stay, and a target that has to be waited for counts towards learning */
+static unsigned late_run_need(void) {   /* g_late_mu held */
+    static int need = -1;
+    if (need < 0) { const char *e = getenv("TOTK_BOTW_LATE_RUN"); char *end = NULL; long v = e ? strtol(e, &end, 10) : -1; need = e && *e && !*end && v >= 0 && v <= LATE_LEARN ? (int)v : LATE_LEARN_RUN; }
+    return (unsigned)need;
+}
 static void late_count(uint64_t serial) {
     pthread_mutex_lock(&g_late_mu);
     if (late_ring(serial) < 0) {
-        int i, free_i = -1, min_i = 0;
-        for (i = 0; i < 16; i++) { if (g_late_cand[i].serial == serial) break; if (!g_late_cand[i].serial && free_i < 0) free_i = i; if (g_late_cand[i].waits < g_late_cand[min_i].waits) min_i = i; }
-        if (i == 16) { i = free_i >= 0 ? free_i : min_i; g_late_cand[i] = (late_cand){serial, 0}; }
-        if (++g_late_cand[i].waits >= LATE_LEARN) {
+        unsigned run_need = late_run_need();
+        int i = late_cand_wait(g_late_cand, serial, atomic_load(&g_cur_frame), run_need);
+        if (i >= 0) {
             int n = atomic_load(&g_late_n), r = -1;
             if (n < LATE_MAX) r = n;
             else for (int q = 0; q < LATE_MAX && r < 0; q++) {   // a target no longer rendered, with nothing in flight
@@ -24162,9 +24169,15 @@ static void late_count(uint64_t serial) {
             if (r >= 0) {
                 free(g_late_post[r]); g_late_post[r] = NULL; g_late_post_n[r] = 0; g_late_lseq[r]++; atomic_store(&g_late_last[r], g_fence);
                 atomic_store(&g_late_sera[r], serial); if (r == n) atomic_store(&g_late_n, n + 1);
-                MLOG("[late-wb] ser=%llu: the flush waited for its rendering %d times; from now on it lands when its submission completes (slot %d)", (unsigned long long)serial, LATE_LEARN, r);
+                if (run_need && g_late_cand[i].run >= run_need)
+                    MLOG("[late-wb] ser=%llu: the flush waited for its rendering in %u frames close together (%u times, up to frame %llu); from now on it lands when its submission completes (slot %d)",
+                         (unsigned long long)serial, g_late_cand[i].run, g_late_cand[i].waits, (unsigned long long)g_late_cand[i].frame, r);
+                else
+                    MLOG("[late-wb] ser=%llu: the flush waited for its rendering %u times; from now on it lands when its submission completes (slot %d)", (unsigned long long)serial, g_late_cand[i].waits, r);
+                g_late_cand[i] = (late_cand){0};
+            } else {   /* it stays in the table and asks again at its next wait */
+                static uint64_t full; if (++full == 1 || full % 1000 == 0) MLOG("[late-wb] ser=%llu is waited for often enough, but each of the %d slots holds a target still being rendered: the flush keeps waiting for it (%llu such waits so far)", (unsigned long long)serial, LATE_MAX, (unsigned long long)full);
             }
-            g_late_cand[i] = (late_cand){0, 0};
         }
     }
     pthread_mutex_unlock(&g_late_mu);
