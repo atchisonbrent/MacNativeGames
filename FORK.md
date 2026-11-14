@@ -1,6 +1,6 @@
 # What this branch changes, and why
 
-Eleven changes to the Metal backend (`games/totk/third_party/d2r_gfx/gfx/nvn/`) on top of MacNativeGames `f9f7aa8`
+Twelve changes to the Metal backend (`games/totk/third_party/d2r_gfx/gfx/nvn/`) on top of MacNativeGames `f9f7aa8`
 (upstream `main` of 2026-11-13), made while running Tears of the Kingdom 1.4.3 and Breath of the Wild 1.9.0 on an M6
 Mac mini connected to an LG G3 (3840x2160, HDR, 40-120 Hz). One commit per change, each standing on the ones before
 it. Nothing here has been sent upstream. Upstream `main` has moved on since `f9f7aa8` and `nvn_mtl.m` no longer merges
@@ -21,6 +21,7 @@ This file is kept up to date as the branch changes; the log at the end says what
 | 9 | gfx(hdr): the FP16 surface stays through frames without an HDR picture | While HDR is on the layer stays FP16 / EDR, and a picture without an HDR companion is decoded into it at SDR white. `TOTK_HDR_SURFACE_KEEP=0` is the behaviour before | Such a frame switched the layer to BGRA8 and back, draining the GPU each time: in BOTW 1.9.0 at every opening and closing of the weapon wheel |
 | 10 | gfx(write-back): sixteen learned targets instead of eight (Breath of the Wild) | `LATE_MAX` 8 to 16; `TOTK_BOTW_LATE_LOG=1` lists the renderings the game's flush still waits for | In the open world the eight slots went to per-frame targets, and two cube maps the game renders every tenth frame never got one: every tenth frame took 13 ms instead of 8.6 (20 instead of 10.1 with HDR). Frame time p95 12.5 to 9.6 ms, with HDR 19.7 to 11.3 ms. `LATE_MAX` is still 8 in upstream `main` at `2f81ef5e` |
 | 11 | gfx(present): a frontend's overlay box drawn into the presented picture | `mtl_front_overlay()` takes a premultiplied BGRA bitmap and a position in drawable pixels; the present pass draws it over the picture with alpha blending, in a pipeline of its own. Staging in `front_overlay.h`, with a GPU-free test | On a variable-refresh display macOS varies the refresh only while the game's layer is the one thing on the screen that changes. A frontend's statistics box redrawing ten times a second in a layer above the game kept the display on its fixed grid: 21.8% of pictures stayed up for a second refresh at about 94 fps, against 0.17% with the box drawn into the picture and 0.27% with no box |
+| 12 | gfx(botw): a waited-for render target is learned after eight frames of waits | A second learning rule beside the 120 waits: a wait in 8 frames, each no more than 120 frames after the one before (`late_learn.h`, with a GPU-free test; the write-back GPU probe drives it through `late_count`). `LATE_MAX` 16 to 32; a target that is due and finds no slot asks again at its next wait; the table of targets being counted holds 64 and replaces leftovers first. `TOTK_BOTW_LATE_RUN=<frames>` changes the eight, 0 switches the rule off | The eleven targets of the open world were learned one after another, 120 waits each (the wait for one leaves the others' renderings finished when their flush looks), the two cube maps of every tenth frame last: with HDR at about 95 fps, frames took 12 to 16 ms instead of 10.5 and every tenth one 19.6 ms until about 2,400 frames after the world appeared, and again after each new scene. Now the last is learned about 180 frames after the world appears and the frame time is at p95 11.0 ms from the next 300-frame window on. Upstream `main` at `3edfb0b6` has the 120-wait rule alone |
 
 Commit 6 stands on its own in what it changes, and is the one most worth having. Commit 10 is two lines and stands on
 its own too. Commit 11 does nothing until a frontend calls it.
@@ -31,11 +32,18 @@ Checked: `make -C games/totk/third_party/d2r_gfx/gfx/nvn/tests run` passes at co
 from commits 1 to 6 (TOTK 1.4.3) and 1 to 10 (BOTW 1.9.0) run on the M6: both games survive 30 s marked not active;
 BOTW HDR engages on every gameplay frame. With commits 8 to 10, at 2560x1440 with MetalFX to 3840x2160, with and
 without HDR: no dark picture and no switch of the surface at the weapon wheel or the pause menu, window shots of the
-wheel with and without HDR agree, and the tenth-frame stall is gone. With commit 11, cores of both games built from
+wheel with and without HDR agree, and the tenth-frame stall is gone (once the targets are learned: see commit 12). With commit 11, cores of both games built from
 commits 1 to 11, 3840x2160 with HDR: a 691x502 box updated ten times a second shows in window shots, translucent over
 the picture, also after 6 s marked not active; pictures held for a second refresh as in the table (TOTK at about
 115 fps: 0.03% with the box, 0 without); frame time p50 / p95 10.68 / 11.26 ms with the box against 10.64 / 11.19
-without (BOTW).
+without (BOTW). With commit 12, cores of both games built from commits 1 to 12, 2560x1440 with MetalFX to 3840x2160 and
+HDR, BOTW 1.9.0 loading a save into the open world, three runs with the rule (the last on this commit, two on
+earlier versions of it) and one with `TOTK_BOTW_LATE_RUN=0` (on an earlier version): with the rule every target is
+learned 175 to 225 frames after the world appears (fifteen slots in use, no target without a slot), the 300-frame
+window that ends about 700 frames after it has frame time p95 11.3 to 11.8 ms, and every window after that 10.9 to
+11.2 ms with no picture held for a second refresh; without it p95 stays at 19.6 to 19.8 ms until about 2,400 frames
+after the world appears. TOTK 1.4.3 on the same build: 115 fps, 1 picture of 3,000
+held, as before. The tests pass at 12; six mutations of the counting each fail `t_late_learn`.
 
 Not checked:
 
@@ -53,8 +61,13 @@ Not checked:
   to 3840x2160 it ran at about 110 fps where the same scene held 120 without HDR.
 - BOTW 1.9.0 HDR through MacNativeGames' own app: its settings panel has no HDR row for BOTW, so there it needs
   `TOTK_HDR=1` or `hdr.txt`.
-- Commit 10 for the first half minute after a save loads: the stall is still there until the targets are learned
-  (frame time p95 19.7 ms with HDR for about 35 s in one place, 11.2 after).
+- Commit 12 beyond loading one save into one place: entering and leaving a shrine, a second load in one session
+  (the old scene's slots are free again 2,000 submissions after its last rendering), long play, and the write-back
+  GPU probe as changed (it compiles with the backend in the tests; it was not run). The rule shows that a target is
+  rendered and read again and again, not that its reader can do with the rendering before the last: a target rendered
+  and read in nine frames and never again gets the eighth rendering at its ninth read (the 120-wait rule needed 121
+  for that). None is known in the game, and none was looked for beyond the runs above. Four more targets are learned
+  than before, those the flush waits for only while the others are being learned.
 - Commit 11 on a BGRA8 drawable (every run had the FP16 surface), with a box that reaches past the drawable, with
   frame interpolation, and for what its first use costs (a shader library and a pipeline are built in the present
   pass, once per drawable format).
@@ -70,3 +83,5 @@ The changes were written with Claude (Anthropic) and, for parts, GPT through Cod
 - 2026-11-14: branch published. Commits 1 to 7 on `f9f7aa8`.
 - 2026-11-14: commits 8 to 10 (the menu flash, the HDR surface, the tenth-frame stall), merged from the series branch.
 - 2026-11-14: commit 11 (a frontend's overlay box drawn into the presented picture), merged from the series branch.
+- 2026-11-14: commit 12 (a waited-for render target is learned after eight frames of waits), merged from the series
+  branch.
