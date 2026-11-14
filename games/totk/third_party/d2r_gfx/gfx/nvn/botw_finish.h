@@ -93,6 +93,7 @@ static int botw_fin_upscale(__unsafe_unretained NvShader *fs, int replaced) {
     rp_end(); blit_close(); rs_sync();
     pt_mark(g_cb, 'F', nil);
     if (!bfin_pass(src, dst, R.clear_c[0], R.cc[0])) return 0;
+    hdr_shadow_external(dst);   // the private encoder wrote the FP16 companion
     R.clear_c[0] = 0;   // done by the pass: still pending, it would wipe the picture when the UI opens the canvas's pass
     if (!g_bfin.off_n++) MLOG("[fxaa] BotW: FXAA off, the picture %lux%lu drawn into the canvas %lux%lu %s", (unsigned long)src.width, (unsigned long)src.height,
                               (unsigned long)dst.width, (unsigned long)dst.height, src.width == dst.width && src.height == dst.height ? "texel for texel" : "bilinear");
@@ -123,6 +124,7 @@ static void botw_fin_before(__unsafe_unretained NvShader *fs) {
     id<MTL4ComputeCommandEncoder> b = blit();
     enc_b_copy_texture(b, g_bfin.scratch, 0, 0, MTLOriginMake(0, 0, 0), MTLSizeMake(c.width, c.height, 1), c, 0, 0, MTLOriginMake(0, 0, 0));
     blit_close();
+    hdr_shadow_external(c);   // mark again after the deferred sharpen, including a prior mirror
     if (!g_bfin.sharp_n++ || g_bfin.sharp_n % 3600 == 0)
         MLOG("[fxaa] BotW: sharpening %d%% on the canvas %lux%lu before the %s (%llu frames)", pct, (unsigned long)c.width, (unsigned long)c.height,
              writes ? "first UI draw" : "copy to the screen", (unsigned long long)g_bfin.sharp_n);

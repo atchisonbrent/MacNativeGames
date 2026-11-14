@@ -75,6 +75,9 @@ static _Atomic int g_mesh_trace_frames;
 #include "../../../../zeldaVR/gfx/totk_vr_link.h"
 #include "totk_hdr.h"
 #include "totk_hdr_compose.h"
+#if BOTW_HDR_SUPPORTED
+#include "botw_hdr_compose.h"
+#endif
 #include "totk_hdr_present.h"
 extern int front_hdr_enabled(void) __attribute__((weak_import));
 extern void front_hdr_present_mode(int enabled) __attribute__((weak_import));
@@ -7576,7 +7579,18 @@ static NvShader *shader_load_mode(NSString *pc, int stage, int archive_compute) 
     /* HDR / EDR (PR #1129, Mac 1.4.3): the scene compose and the post shader get an HDR twin (hdr_fn) next to the shipped
        function. fn stays the game's, so with HDR off every pipeline, key and binding is the one without HDR; a pipeline
        takes the twin only when HDR is on for its frame (PSO_HDR in its key). */
-    if (totk_hdr_available() && stage == 1 && full) {
+    if (totk_hdr_available() && stage == 1 && (full || BOTW_HDR_SUPPORTED)) {
+#if BOTW_HDR_SUPPORTED
+        if ([pc hasPrefix:@BOTW_HDR_COMPOSE_KEY]) {
+            NSString *modified=botw_hdr_compose_source(full);
+            NSError *err=nil;id<MTLLibrary> hl=modified?totk_msl_library(modified,&err):nil;
+            id<MTLFunction> hf=hl?[hl newFunctionWithName:j[@"entry"]]:nil;
+            if(hf){o->hdr_fn=hf;fn_note_src(hf,modified);o->hdr_compose=1;
+                MLOG("[hdr] BOTW 1.9.0 compose: HDR twin ready (Neutwo, middle-grey matched)");}
+            else if(!atomic_exchange(&g_hdr_shader_failed,1))
+                MLOG("[hdr] BOTW compose layout / compile unsupported, HDR stays off: %s",err.localizedDescription.UTF8String?:full?"source anchors differ":"no shader source to rewrite");
+        }
+#else
         int kind = [pc hasPrefix:@TOTK_HDR_COMPOSE_KEY] ? 1 : [pc hasPrefix:@TOTK_HDR_POST_KEY] ? 2 : 0;
         if (kind) {
             NSString *modified = kind == 1 ? totk_hdr_compose_source(full) : totk_hdr_post_source(full);
@@ -7592,6 +7606,7 @@ static NvShader *shader_load_mode(NSString *pc, int stage, int archive_compute) 
                 MLOG("[hdr] unsupported %s shader layout / compile, HDR stays off: %s", kind == 1 ? "compose" : "postprocess",
                      err.localizedDescription.UTF8String ?: "source anchors differ"); }
         }
+#endif
     }
     if (o->rf.nb) {
         o->ae = [o->fn newArgumentEncoderWithBufferIndex:o->rf.abi];
@@ -10507,10 +10522,12 @@ static void *pso_get_p(NvProg *pr, MTLRenderPassDescriptor *unused) {
     /* Preserve the guest RGB-only destination alpha while rendering into its
      * host FP16 companion. Normalized factors also form the persistent PSO key,
      * so a cached RGBA blend pipeline cannot reintroduce the old UI tint. */
+#if !BOTW_HDR_SUPPORTED
     if(g_hdr_draw_native && !g_pso_lmap && k.cfmt[0]==MTLPixelFormatRGBA16Float && (k.blend_en&1)){
         k.blend[0].src_rgb=hdr_shadow_rgb_factor(k.blend[0].src_rgb);
         k.blend[0].dst_rgb=hdr_shadow_rgb_factor(k.blend[0].dst_rgb);
     }
+#endif
     if (g_pass.layered) k.a2c |= PSO_LAYERED;   // TOTK: layered pass (see g_lay)
     int hdr = fs && fs->hdr_fn && atomic_load(&g_hdr_frame_enabled);   // HDR / EDR on: the shader's HDR twin (PR #1129)
     if (hdr) k.a2c |= PSO_HDR;
@@ -15653,7 +15670,7 @@ static void hdr_prepare_shader_reads(NvShader *sh,int stage) {
             tid=(int)(S.tex[stage][b->reg]&0xfffff);
             if(tid>0) {
                 id<MTLTexture> t=(__bridge id<MTLTexture>)tex_fast(tid);
-                if(hdr_shadow_base(t).pixelFormat==MTLPixelFormatRG11B10Float)reads[nr++]=t;
+                if(hdr_shadow_format(hdr_shadow_base(t).pixelFormat))reads[nr++]=t;
             }
         } else if(b->kind==NVN_RB_IMG && b->reg<32) {
             tid=(int)(S.img[stage][b->reg]&0xfffff);
@@ -16961,17 +16978,31 @@ static int easu_site(__unsafe_unretained NvShader *fs, id<MTLTexture> *src_out, 
     *src_out = src; *dst_out = dst; *cw_out = cw; *ch_out = ch; *mode_out = color_mode;
     return 0;
 }
+#if BOTW_HDR_SUPPORTED
+static int bfin_pass(id<MTLTexture> src,id<MTLTexture> dst,int clear,MTLClearColor cc);
+#endif
 static int mfxup_dock(__unsafe_unretained NvShader *fs) {
     id<MTLTexture> src = nil, dst = nil; NSUInteger cw = 0, ch = 0; int color_mode = 0;
     int why = easu_site(fs, &src, &dst, &cw, &ch, &color_mode);
     if (why < 0) return 0;
     if (why) { g_mfxup_dock_no[why]++; return 0; }
-    if (!mfxup_prepare(MFXUP_DOCKED, src, dst, dst.width, dst.height, color_mode)) { g_mfxup_dock_no[0]++; return 0; }   // scaler still being built (background): the game's own upscale this frame
+    id<MTLTexture> scaler_dst=dst;
+#if BOTW_HDR_SUPPORTED
+    /* BOTW FXAA writes RGB only. MetalFX writes RGBA: use its private FP16
+     * output, then copy RGB to the companion while retaining canvas alpha. */
+    int keep_alpha=g_hdr_draw_native && !strncmp(fs->key,BOTW_MFXUP_KEY,65);
+    if(keep_alpha)scaler_dst=nil;
+#endif
+    if (!mfxup_prepare(MFXUP_DOCKED, src, scaler_dst, dst.width, dst.height, color_mode)) { g_mfxup_dock_no[0]++; return 0; }   // scaler still being built (background): the game's own upscale this frame
     rp_end(); blit_close(); rs_sync();   // MetalFX encodes on the command buffer itself: the encode thread must be idle first
     pt_mark(g_cb, 'X', nil);   // TOTK_PASS_GPU: the MetalFX upscale as its own entry
     hdr_shadow_external(dst);
-    if (!mfxup_encode_ex(MFXUP_DOCKED, g_cb, src, cw, ch, dst, dst.width, dst.height, color_mode)) { g_mfxup_dock_no[0]++; return 0; }
+    id<MTLTexture> scaled=mfxup_encode_ex(MFXUP_DOCKED,g_cb,src,cw,ch,scaler_dst,dst.width,dst.height,color_mode);
+    if (!scaled) { g_mfxup_dock_no[0]++; return 0; }
     mfxup_queue_residency();
+#if BOTW_HDR_SUPPORTED
+    if(keep_alpha && !bfin_pass(scaled,dst,R.clear_c[0],R.cc[0])) { g_mfxup_dock_no[0]++;return 0; }
+#endif
     R.clear_c[0] = 0;   // MetalFX wrote every pixel of the canvas: a clear still pending for it would wipe the picture when the UI opens the pass
     g_mfxup_dock_n++; atomic_store(&g_mfxup_last, atomic_load(&g_cur_frame));
     return 1;

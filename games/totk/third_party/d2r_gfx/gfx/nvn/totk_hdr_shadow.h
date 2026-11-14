@@ -2,6 +2,16 @@
 /* Host-only FP16 companions for render and compute scene postprocessing. Guest formats,
  * byte sizes and CPU-visible storage stay intact. No generic format promotion.
  * This file is included after the replay, residency and encoder helpers. */
+#if BOTW_HDR_SUPPORTED
+#include "botw_hdr_shadow.h"
+#endif
+static inline int hdr_shadow_format(MTLPixelFormat format) {
+#if BOTW_HDR_SUPPORTED
+    return botw_hdr_shadow_format(format);
+#else
+    return format==MTLPixelFormatRG11B10Float;
+#endif
+}
 #define HDR_SHADOW_MAX 24
 static struct {
     id<MTLTexture> base, texture;   // strong: a retired base cannot be recycled at the same address
@@ -26,7 +36,7 @@ static int g_hdr_companion_store;
 #endif
 static id<MTLTexture> hdr_shadow_base(id<MTLTexture> t);
 static id<MTLTexture> hdr_shadow_find(id<MTLTexture> source) {
-    if(!source || !hdr_shadow_enabled() || source.pixelFormat!=MTLPixelFormatRG11B10Float)return nil;
+    if(!source || !hdr_shadow_enabled() || !hdr_shadow_format(source.pixelFormat))return nil;
     id<MTLTexture> base=hdr_shadow_base(source);
     if(source.width!=base.width || source.height!=base.height || source.mipmapLevelCount!=1)return nil;
     uint64_t frame=atomic_load(&g_cur_frame);
@@ -41,10 +51,12 @@ static id<MTLTexture> hdr_shadow_find(id<MTLTexture> source) {
 static id<MTLTexture> hdr_shadow_sample(id<MTLTexture> source) {
     id<MTLTexture> hdr=hdr_shadow_find(source);if(!hdr)return nil;
     MTLTextureSwizzleChannels sw=source.swizzle;
+#if !BOTW_HDR_SUPPORTED
     if(sw.red==MTLTextureSwizzleAlpha)sw.red=MTLTextureSwizzleOne;
     if(sw.green==MTLTextureSwizzleAlpha)sw.green=MTLTextureSwizzleOne;
     if(sw.blue==MTLTextureSwizzleAlpha)sw.blue=MTLTextureSwizzleOne;
     if(sw.alpha==MTLTextureSwizzleAlpha)sw.alpha=MTLTextureSwizzleOne;
+#endif
     uint64_t bits=(uint64_t)sw.red|((uint64_t)sw.green<<8)|((uint64_t)sw.blue<<16)|((uint64_t)sw.alpha<<24)|((uint64_t)source.textureType<<32);
     for(unsigned i=0;i<HDR_SHADOW_MAX;i++)if(g_hdr_shadow[i].texture==hdr){
         if(!g_hdr_shadow[i].reads)g_hdr_shadow[i].reads=[NSMutableDictionary dictionary];
@@ -72,8 +84,8 @@ static int hdr_shadow_rgb_factor(int factor) {
 /* A render copy converts formats, unlike a blit. Guest readers use a synced
  * original; rendering and full-size sampling keep the FP16 companion. */
 static void hdr_shadow_copy(id<MTLTexture> src,id<MTLTexture> dst) {
-    static id<MTLRenderPipelineState> to16,to11;
-    id<MTLRenderPipelineState> pso=dst.pixelFormat==MTLPixelFormatRGBA16Float?to16:to11;
+    static id<MTLRenderPipelineState> to16,toGuest;
+    id<MTLRenderPipelineState> pso=dst.pixelFormat==MTLPixelFormatRGBA16Float?to16:toGuest;
     if(!pso) {
         NSString *msl=totk_hdr_copy_source();
         NSError *e=nil;id<MTLLibrary> l=[g_dev newLibraryWithSource:msl options:nil error:&e];
@@ -82,7 +94,7 @@ static void hdr_shadow_copy(id<MTLTexture> src,id<MTLTexture> dst) {
         p.colorAttachments[0].pixelFormat=dst.pixelFormat;
         pso=[g_dev newRenderPipelineStateWithDescriptor:p error:&e];
         if(!pso)MDIE("HDR format conversion compile: %s",e.localizedDescription.UTF8String);
-        if(dst.pixelFormat==MTLPixelFormatRGBA16Float)to16=pso;else to11=pso;
+        if(dst.pixelFormat==MTLPixelFormatRGBA16Float)to16=pso;else toGuest=pso;
     }
     blit_close();rs_sync();
     MTL4RenderPassDescriptor *p=[MTL4RenderPassDescriptor new];
@@ -107,9 +119,9 @@ static id<MTLTexture> hdr_shadow_base(id<MTLTexture> t) {
 /* No encoders or locks here: also called under the registry lock and by upload
  * workers. Other threads invalidate by epoch, never by touching replay's slots. */
 static void hdr_shadow_invalidate(id<MTLTexture> source) {
-    /* Only an R11 base can have a slot, and a slot is fresh only when its base has neither a
+    /* Only an eligible base can have a slot, and a slot is fresh only when its base has neither a
      * heap nor a buffer behind it (hdr_shadow_make_draw), so no other object aliases its pages. */
-    id<MTLTexture> base=hdr_shadow_base(source);if(!base || base.pixelFormat!=MTLPixelFormatRG11B10Float)return;
+    id<MTLTexture> base=hdr_shadow_base(source);if(!base || !hdr_shadow_format(base.pixelFormat))return;
     if(!on_sub_thread()){hdr_shadow_invalidate_all();return;}
     for(unsigned i=0;i<HDR_SHADOW_MAX;i++)if(g_hdr_shadow[i].base==base)g_hdr_shadow[i].fresh=0;
 }
@@ -181,7 +193,7 @@ static void hdr_shadow_original_write(id<MTLTexture> base) { hdr_shadow_sync(bas
 static id<MTLTexture> hdr_shadow_make_draw(id<MTLTexture> source) {
     id<MTLTexture> base=hdr_shadow_base(source);   // views and writers must agree on the slot key
     if(!base || source.width!=base.width || source.height!=base.height || base.textureType!=MTLTextureType2D || base.mipmapLevelCount!=1 || base.sampleCount!=1 ||
-       base.pixelFormat!=MTLPixelFormatRG11B10Float)return nil;
+       !hdr_shadow_format(base.pixelFormat))return nil;
     id<MTLTexture> found=hdr_shadow_find(base);if(found)return found;
     unsigned slot=HDR_SHADOW_MAX;uint64_t oldest=UINT64_MAX,frame=atomic_load(&g_cur_frame);
     for(unsigned i=0;i<HDR_SHADOW_MAX;i++) {

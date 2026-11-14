@@ -4,7 +4,7 @@ static struct { uint64_t serial, frame; id<MTLTexture> texture, base; float ui_w
 static unsigned g_hdr_nswap;
 static __thread float t_hdr_present_white=1,t_hdr_present_peak=1;
 static int hdr_on(void) {
-#if TARGET_OS_OSX && !defined(GAME_BOTW)
+#if TARGET_OS_OSX && (!defined(GAME_BOTW) || BOTW_HDR_SUPPORTED)
     return totk_hdr_available();
 #else
     return 0;
@@ -46,7 +46,13 @@ static id<MTLTexture> hdr_swap_take(uint64_t serial,uint64_t frame,id<MTLTexture
 /* The compose is the only origin of new HDR data. Propagate its FP16
  * companion through draws that consume it, then keep using it for UI blending.
  * Resource identity + current frame prevent unrelated R11 textures being upgraded. */
+#if BOTW_HDR_SUPPORTED
+#include "botw_hdr_render.h"
+#endif
 static void hdr_prepare_draw(NvProg *pr) {
+#if BOTW_HDR_SUPPORTED
+    botw_hdr_prepare_draw(pr);
+#else
     g_hdr_draw_native=0;
     if(!hdr_shadow_enabled() || !pr || !pr->sh[1] || R.rt.n!=1 || !R.rt.color[0])return;
     NvShader *fs=pr->sh[1];
@@ -67,17 +73,27 @@ static void hdr_prepare_draw(NvProg *pr) {
     if(!origin && !linked)return;
     /* Intercepts below may consume a pending clear without opening a pass. */
     if(hdr_shadow_make_draw(dst))g_hdr_draw_native=1;
+#endif
 }
 /* Preserve the float canvas before the exact final copy writes to the 8-bit
  * sRGB swapchain. Never promote arbitrary guest textures or their CPU storage. */
 static void hdr_capture(NvProg *pr) {
     if(!hdr_on() || !atomic_load(&g_hdr_frame_enabled) || !pr || !pr->sh[0] || !pr->sh[1] || R.rt.n!=1 || !R.rt.color[0])return;
+#if BOTW_HDR_SUPPORTED
+    if(strncmp(pr->sh[1]->key,BOTW_HDR_COPY_FS,65) || strncmp(pr->sh[0]->key,BOTW_HDR_COPY_VS,65))return;
+#else
     if(strncmp(pr->sh[1]->key,"dd3d1e0ebf73242845970b5655fac199a30f5acf747975c5e771caa49af8b12b-",65) ||
        strncmp(pr->sh[0]->key,"1a40e5f5ff257e13293c01b8e293a619d2ae8cdcffd8e4083e04dd7f59fd2273-",65))return;
+#endif
     unsigned slot=8;pthread_mutex_lock(&g_hdr_mu);
     for(unsigned i=0;i<g_hdr_nswap;i++)if(g_hdr_swap[i].serial==R.rt.color[0]->serial)slot=i;
     pthread_mutex_unlock(&g_hdr_mu);if(slot==8)return;
     int tid=(int)(S.tex[1][0]&0xfffff);
+#if BOTW_HDR_SUPPORTED
+    /* This copy shader also exists outside gameplay. Only a current-frame
+     * companion is evidence that its source passed through our scene map. */
+    if(tid<=0 || !hdr_shadow_find((__bridge id<MTLTexture>)tex_raw_lk(tid)))return;
+#endif
     id<MTLTexture> src=tid>0?(__bridge id<MTLTexture>)tex_fast_lk(tid):nil;
     id<MTLTexture> dst=tex_mtl(R.rt.color[0]);
     if(!src || !dst || src.pixelFormat!=MTLPixelFormatRGBA16Float || src.textureType!=MTLTextureType2D ||
