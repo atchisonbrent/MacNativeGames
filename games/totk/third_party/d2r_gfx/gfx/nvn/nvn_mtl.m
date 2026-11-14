@@ -20023,10 +20023,22 @@ int mtl_display_hz(void) {
 static _Atomic uint64_t g_present_stall_ns;   // 单测用：出图线程每次出图前额外停顿（模拟 drawable 迟迟不可用） | For unit tests: an extra pause before each present on the present thread (simulating a drawable that stays unavailable)
 static CAMetalLayer *g_present_layer_resident;
 void mtl_present_test_stall(uint64_t ns) { g_present_stall_ns = ns; }
+static id<MTLRenderPipelineState> g_blit_lin_pso;   // FP16 target: a picture the sampler hands over linear already (an _sRGB format), copied as it is
+/* The pipeline for the game's picture. An FP16 picture or an FP16 drawable takes the HDR copy, but for an SDR picture on
+   the kept FP16 surface (t_hdr_present_sdr): that one is decoded from sRGB to the surface's linear values at SDR white,
+   once: by the shader for a UNORM picture, by the sampler for an _sRGB one. */
+static id<MTLRenderPipelineState> present_picture_pso(id<MTLTexture> pic, id<MTLTexture> dst) {
+    if (!g_blit_hdr_pso) return g_blit_pso;
+    if (pic.pixelFormat == MTLPixelFormatRGBA16Float) return g_blit_hdr_pso;
+    if (dst.pixelFormat != MTLPixelFormatRGBA16Float) return g_blit_pso;
+    if (!t_hdr_present_sdr) return g_blit_hdr_pso;
+    MTLPixelFormat f = pic.pixelFormat;
+    return g_blit_lin_pso && (f == MTLPixelFormatRGBA8Unorm_sRGB || f == MTLPixelFormatBGRA8Unorm_sRGB) ? g_blit_lin_pso : g_blit_pso;
+}
 static void present_pipeline(MTLPixelFormat format, BOOL hdrSource) {
     BOOL hdrAvailable=hdrSource || format==MTLPixelFormatRGBA16Float;
     if (!g_blit_pso || g_blit_fmt != format || g_blit_hdr_source!=hdrAvailable) {
-        g_blit_hdr_source=hdrAvailable;g_blit_hdr_pso=nil;
+        g_blit_hdr_source=hdrAvailable;g_blit_hdr_pso=nil;g_blit_lin_pso=nil;
         if(getenv("TOTK_HDR") || getenv("TOTK_HDR_CONTROL"))MLOG("[hdr] presentation: format %lu, HDR shader %s, supported %d",(unsigned long)format,hdrAvailable?"on":"off",totk_hdr_available());
         NSString *source=totk_hdr_present_source(format,hdrAvailable);
         NSError *e = nil;
@@ -20040,6 +20052,7 @@ static void present_pipeline(MTLPixelFormat format, BOOL hdrSource) {
         if(hdrAvailable){
             pd.fragmentFunction=[lib newFunctionWithName:@"fshdr"];g_blit_hdr_pso=[g_dev newRenderPipelineStateWithDescriptor:pd error:&e];
             if(!g_blit_hdr_pso)MDIE("HDR presentation pipeline: %s",e.localizedDescription.UTF8String);
+            if(format==MTLPixelFormatRGBA16Float){pd.fragmentFunction=[lib newFunctionWithName:@"fslin"];g_blit_lin_pso=[g_dev newRenderPipelineStateWithDescriptor:pd error:&e];}   // nil: present_picture_pso falls back
         }
         g_blit_fmt = format;
         MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new]; sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterLinear; sd.supportArgumentBuffers = YES;
@@ -20295,7 +20308,7 @@ static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTex
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
     id<MTLRenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp]; es_reset();
     [en setViewport:vp];
-    [en setRenderPipelineState:g_blit_hdr_pso && (src.pixelFormat==MTLPixelFormatRGBA16Float || dst.pixelFormat==MTLPixelFormatRGBA16Float) ? g_blit_hdr_pso : g_blit_pso];   // an FP16 picture or drawable: the HDR copy
+    [en setRenderPipelineState:present_picture_pso(src, dst)];   // an FP16 picture or drawable: the HDR copy
     [en setFragmentTexture:src atIndex:0];
     [en setFragmentSamplerState:g_blit_samp atIndex:0];
     float uv[12] = {(float)cx / src.width, (float)cy / src.height, (float)cw / src.width, (float)ch / src.height,
@@ -20362,7 +20375,7 @@ static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MT
 #endif
     [args setAddress:g_present_uv[uv_i].gpuAddress atIndex:0];
     [en setArgumentTable:args atStages:MTLRenderStageFragment];
-    [en setViewport:vp]; [en setRenderPipelineState:g_blit_hdr_pso && (pic.pixelFormat==MTLPixelFormatRGBA16Float || dst.pixelFormat==MTLPixelFormatRGBA16Float) ? g_blit_hdr_pso : g_blit_pso];   // as present_encode
+    [en setViewport:vp]; [en setRenderPipelineState:present_picture_pso(pic, dst)];   // as present_encode
     [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     MTLViewport ovp; float fuv[8];
     [en setRenderPipelineState:g_blit_pso];
@@ -20656,13 +20669,14 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
             if(hdrFrame){t_hdr_present_white=g_pring_white[ring];t_hdr_present_peak=g_pring_peak[ring];}
         } else { id<MTLTexture> linear=hdr_swap_texture(t->serial,frame,&t_hdr_present_white,&t_hdr_present_peak);if(linear){src=linear;hdrFrame=YES;} }
     }
+    t_hdr_present_sdr=0;
     MTLPixelFormat ringFormat=ring>=0?g_pring[ring].pixelFormat:MTLPixelFormatInvalid;
     BOOL hdrRingSkipped=hdrFrame && ring>=0 && g_pring_hdr[ring];
     BOOL hdrRing=hdrFrame && ring>=0 && (hdrRingSkipped || ringFormat==MTLPixelFormatRGBA8Unorm ||
         ringFormat==MTLPixelFormatRGBA8Unorm_sRGB || ringFormat==MTLPixelFormatBGRA8Unorm || ringFormat==MTLPixelFormatBGRA8Unorm_sRGB);
     NSUInteger hdrRingW=hdrRing?g_pring[ring].width:0,hdrRingH=hdrRing?g_pring[ring].height:0;
     if (!src) { RED_ONCE(8, "出图贴图建不出 MTLTexture"); return 0; }
-    if (interp < 0) anom_present(src, frame);   // TOTK_ANOMALY
+    if (interp < 0 && !scene_held) anom_present(src, frame);   // TOTK_ANOMALY (a held frame is not shown)
     /* One-frame temporal fallback (TOTK_FLASH_GUARD=1, off by default): a same-queue readback of the picture's centre
        before the drawable is encoded; on an abrupt colour jump the previous good picture is shown again, at most twice
        in a row. It was a stopgap against the frame-wide flashes; their cause (compressible storage shared across formats,
@@ -20825,8 +20839,13 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     if(atomic_exchange(&hdr_size,wh)!=wh)hdr_shadow_invalidate_all();
 #if TARGET_OS_OSX
     if(totk_hdr_available() && front_hdr_present_mode && !scene_held){
-        MTLPixelFormat want=hdrFrame?MTLPixelFormatRGBA16Float:MTLPixelFormatBGRA8Unorm;
-        if(layer.pixelFormat!=want){mtl_finish_gpu();front_hdr_present_mode(hdrFrame);}
+        /* TOTK_HDR_SURFACE_KEEP (totk_hdr_render.h): an FP16 surface is kept through frames without an HDR picture while
+           HDR is on and its shaders work. It still goes off with the setting, and comes on with the first HDR frame. */
+        BOOL hdrSurface=hdrFrame || (layer.pixelFormat==MTLPixelFormatRGBA16Float && hdr_surface_keep() && totk_hdr_active() && !atomic_load(&g_hdr_shader_failed));
+        t_hdr_present_sdr=hdrSurface && !hdrFrame;   // an SDR picture on the kept surface: decoded into it (present_picture_pso). Not set when the surface goes back to SDR, whatever drawable the display link still hands over
+        if(t_hdr_present_sdr){static int said;if(!said){said=1;MLOG("[hdr] a frame without an HDR picture: the FP16 surface stays and the picture is decoded into it (TOTK_HDR_SURFACE_KEEP=0: the surface is switched for it)");}}
+        MTLPixelFormat want=hdrSurface?MTLPixelFormatRGBA16Float:MTLPixelFormatBGRA8Unorm;
+        if(layer.pixelFormat!=want){mtl_finish_gpu();front_hdr_present_mode(hdrSurface);}
         /* The display link may hand a drawable of the format before the switch. It is drawn into as it is (present_pipeline
            and present_encode go by the drawable's format), never dropped: dropping every such tick stopped the picture for
            7 s at the switch on and 30 s at the switch off (2,800 ticks; 2026-11-03, after PR #1129), since a drawable not
