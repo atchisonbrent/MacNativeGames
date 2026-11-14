@@ -3,6 +3,18 @@ static pthread_mutex_t g_hdr_mu = PTHREAD_MUTEX_INITIALIZER;
 static struct { uint64_t serial, frame; id<MTLTexture> texture, base; float ui_white,peak; } g_hdr_swap[8];
 static unsigned g_hdr_nswap;
 static __thread float t_hdr_present_white=1,t_hdr_present_peak=1;
+/* TOTK_HDR_SURFACE_KEEP (default 1; 0 is the surface switched frame by frame, as before): while HDR is on, the surface
+ * stays FP16 / EDR once it is, and a frame without an HDR picture (a menu drawn over a still of the scene, a title, a
+ * movie) is decoded from sRGB into it at SDR white. Switching the surface for such a frame drains the GPU and changes
+ * the layer's format and colour space twice, at the frame's start and end: Breath of the Wild 1.9.0 did that at every
+ * opening and closing of the weapon wheel (measured 2026-11-14). */
+static __thread int t_hdr_present_sdr;   /* this present puts an SDR picture on the kept FP16 surface */
+static int hdr_surface_keep(void) {
+    static _Atomic int set=-1;
+    int v=atomic_load_explicit(&set,memory_order_relaxed);
+    if(v<0) { const char *e=getenv("TOTK_HDR_SURFACE_KEEP");v=!(e && !strcmp(e,"0"));atomic_store(&set,v); }
+    return v;
+}
 static int hdr_on(void) {
 #if TARGET_OS_OSX && (!defined(GAME_BOTW) || BOTW_HDR_SUPPORTED)
     return totk_hdr_available();

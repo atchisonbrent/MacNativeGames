@@ -5,19 +5,24 @@ HDR_FIXTURE := $(CURDIR)/fixtures/botw_compose_synthetic.metal
 HDR_SYNTHETIC_TWIN := $(OUT)/botw_hdr_synthetic_twin.metal
 HDR_GAME_TWIN := $(OUT)/botw_hdr_twin.metal
 FW := -framework Metal -framework MetalFX -framework Foundation -framework QuartzCore -framework ImageIO -framework CoreGraphics -framework UniformTypeIdentifiers
+WD := $(OUT)/t_gpu_watchdog
+SH := $(OUT)/t_scene_hold
 .PHONY: all run clean hdr
-all: $(BIN) $(WD)
+all: $(BIN) $(WD) $(SH)
 # Force compilation: the backend includes headers beyond this directory.
 .PHONY: FORCE
 $(BIN): FORCE
 	@mkdir -p $(OUT)
 	TMPDIR=$(OUT) xcrun clang -O1 -g -Wall -Wextra -Werror -fobjc-arc -I../include t_present_handoff.m t_present_host.c unused_render_stubs.S -Wl,-dead_strip $(FW) -o $@
-WD := $(OUT)/t_gpu_watchdog
 $(WD): t_gpu_watchdog.c ../gpu_watchdog_rule.h
 	@mkdir -p $(OUT)
 	TMPDIR=$(OUT) xcrun clang -O1 -g -Wall -Wextra -Werror t_gpu_watchdog.c -o $@
-run: $(BIN) $(WD) hdr
+$(SH): t_scene_hold.c ../scene_hold.h
+	@mkdir -p $(OUT)
+	TMPDIR=$(OUT) xcrun clang -O1 -g -Wall -Wextra -Werror t_scene_hold.c -o $@
+run: $(BIN) $(WD) $(SH) hdr
 	@$(WD)
+	@$(SH)
 	@set -e; for c in stale delegate rescue holds power clock winding; do DM_PRESENT_LINK=1 $(BIN) $$c; done
 	@set -e; for mode in 0 1 2; do DM_PRESENT_LINK=$$mode $(BIN) configured; done
 hdr:
@@ -40,6 +45,6 @@ hdr:
 	TMPDIR=$(OUT) xcrun clang -Wall -Wextra -Werror -DGAME_BOTW=1 -DGAME_BOTW190=1 -DTEST_HDR_NONMAC=1 -DEXPECT_HDR=0 t_hdr_gates.c -o $(OUT)/t_hdr_gates
 	TOTK_HDR=1 TOTK_HDR_CONTROL=1 $(OUT)/t_hdr_gates
 clean:
-	rm -f $(BIN) $(WD) $(OUT)/t_botw_hdr $(OUT)/t_hdr_gates $(OUT)/botw_hdr_twin.metal $(OUT)/botw_hdr_twin.air
+	rm -f $(BIN) $(WD) $(SH) $(OUT)/t_botw_hdr $(OUT)/t_hdr_gates $(OUT)/botw_hdr_twin.metal $(OUT)/botw_hdr_twin.air
 	rm -f $(HDR_SYNTHETIC_TWIN) $(OUT)/botw_hdr_synthetic_twin.air $(OUT)/botw_compose_synthetic.air
 	rm -rf $(OUT)/metal-module-cache
