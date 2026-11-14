@@ -7,7 +7,7 @@ static NSString *totk_hdr_copy_source(void) {
       "vertex V vs(uint i [[vertex_id]]){float2 u=float2((i<<1)&2,i&2);return{float4(u*2-1,0,1)};}"
       "fragment float4 fs(V v [[stage_in]],texture2d<float> t [[texture(0)]]){return t.read(uint2(v.p.xy));}";
 }
-static NSString *totk_hdr_present_source(MTLPixelFormat format, BOOL hdrAvailable) {
+static NSString *totk_hdr_present_source(MTLPixelFormat format, BOOL hdrAvailable, BOOL frontOverlay) {
     static const char *original=
         "#include <metal_stdlib>\nusing namespace metal;\n"
         "struct V { float4 p [[position]]; float2 uv; };\n"
@@ -15,7 +15,10 @@ static NSString *totk_hdr_present_source(MTLPixelFormat format, BOOL hdrAvailabl
         "struct Crop { float4 rect; float4 edge; };\n"
         "fragment float4 fs(V in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]], constant Crop& c [[buffer(0)]]) { return t.sample(s, clamp(in.uv * c.rect.zw + c.rect.xy, c.edge.xy, c.edge.zw)); }\n";
     NSString *source=@(original);
-    if(!hdrAvailable)return source;
+    /* Nearest sampling preserves drawable-resolution pixels. Decode straight RGB
+     * on a linear drawable, then restore premultiplication at the boxes' white (1). */
+    NSString *front=@"\nfragment float4 fsfront(V in [[stage_in]], texture2d<float> t [[texture(0)]], constant Crop& c [[buffer(0)]]) { constexpr sampler nearest(coord::normalized, address::clamp_to_edge, filter::nearest); float4 v=t.sample(nearest,clamp(in.uv*c.rect.zw+c.rect.xy,c.edge.xy,c.edge.zw)); %@ }\n";
+    if(!hdrAvailable)return frontOverlay ? [source stringByAppendingFormat:front,@"return v;"] : source;
     BOOL edr=format==MTLPixelFormatRGBA16Float;
     NSString *helpers=@"\n"
         "float3 hdr_decode(float3 c) {\n"
@@ -47,6 +50,7 @@ static NSString *totk_hdr_present_source(MTLPixelFormat format, BOOL hdrAvailabl
         "}\n";
     source=[source stringByReplacingOccurrencesOfString:@"struct Crop" withString:[helpers stringByAppendingString:@"struct Crop"]];
     if(edr)source=[source stringByReplacingOccurrencesOfString:@"return t.sample(s, clamp(in.uv * c.rect.zw + c.rect.xy, c.edge.xy, c.edge.zw));" withString:@"float4 v=t.sample(s, clamp(in.uv * c.rect.zw + c.rect.xy, c.edge.xy, c.edge.zw));return float4(hdr_decode(v.rgb),v.a);"];
+    if(frontOverlay)source=[source stringByAppendingFormat:front,edr ? @"if(v.a==0)return float4(0);return float4(hdr_decode(min(v.rgb/v.a,float3(1)))*v.a,v.a);" : @"return v;"];
     /* fslin: the picture as sampled, for one whose format the sampler decodes (an _sRGB picture on the FP16 surface) */
     source=[source stringByAppendingString:@"\nfragment float4 fslin(V in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]], constant Crop& c [[buffer(0)]]) { return t.sample(s, clamp(in.uv * c.rect.zw + c.rect.xy, c.edge.xy, c.edge.zw)); }\n"];
     source=[source stringByAppendingFormat:@"\nstruct HDRCrop{float4 rect;float4 edge;float headroom;float uiWhite;};\nfragment float4 fshdr(V in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]], constant HDRCrop& c [[buffer(0)]]) {float3 v=t.sample(s,clamp(in.uv*c.rect.zw+c.rect.xy,c.edge.xy,c.edge.zw)).rgb; float3 rgb=hdr_display_bound(v*c.uiWhite,c.headroom);return float4(%@,1);}",edr?@"rgb":@"hdr_encode(rgb)"];
