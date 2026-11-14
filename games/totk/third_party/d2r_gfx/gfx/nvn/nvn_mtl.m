@@ -280,8 +280,15 @@ static void hdr_shadow_invalidate_all(void) { atomic_fetch_add_explicit(&g_hdr_s
 static void hdr_shadow_invalidate(id<MTLTexture> source);
 static void hdr_shadow_invalidate_pass(MTL4RenderPassDescriptor *pd);
 static inline void ka_stop_now(void);   // keep-alive spin kernel: leave now, game work is coming (below, keepalive_start)
-static void q4_commit(id<MTL4CommandBuffer> cb, TotkCommitOptions *o) {
+/* The GPU completion watchdog (gpu_watchdog_main, below) counts a watched command buffer here, after the gate: one held
+   at bg_gate while the app is not active has not reached the GPU, and counting it before the gate (in gpu_tag_begin, as
+   until 2026-11-13) made the watchdog end the game as a GPU hang after 10 s in a frontend's pause menu (Breath of the
+   Wild 1.9.0, three times, each 10 s after the frontend marked the game not active). Only the two commits whose feedback
+   calls gpu_tag_done are watched (mtl_sub_split_done, mtl_sub_commit). */
+static void cbw_commit_begin(void);
+static void q4_commit_gated(id<MTL4CommandBuffer> cb, TotkCommitOptions *o, int watched) {
     bg_gate();
+    if (watched) cbw_commit_begin();
     gpu_budget_check("提交命令缓冲");
     atomic_fetch_add(&g_q4_inflight, 1);
     ka_stop_now();
@@ -289,6 +296,8 @@ static void q4_commit(id<MTL4CommandBuffer> cb, TotkCommitOptions *o) {
     if (!nogpu()) { id<MTL4CommandBuffer> buffers[] = {cb}; [g_q4 commit:buffers count:1 options:o]; return; }
     for (MTL4CommitFeedbackHandler h in o->handlers) h(nil);
 }
+static void q4_commit(id<MTL4CommandBuffer> cb, TotkCommitOptions *o) { q4_commit_gated(cb, o, 0); }
+static void q4_commit_watched(id<MTL4CommandBuffer> cb, TotkCommitOptions *o) { q4_commit_gated(cb, o, 1); }   // after gpu_tag_begin, with gpu_tag_done in a feedback handler
 static void cb_commit(id<MTLCommandBuffer> cb) { bg_gate(); if (!nogpu()) [cb commit]; }
 static void cb_wait(id<MTLCommandBuffer> cb) { if (!nogpu()) [cb waitUntilCompleted]; if(cb.error)hdr_shadow_invalidate_all(); }
 static uint64_t g_fence;                        // 已提交的最大栅栏值（提交线程独占递增） | Highest committed fence value (incremented exclusively by the submit thread)
@@ -2971,20 +2980,24 @@ void mtl_set_frame(uint64_t f) {
    the GPU firmware is wedged (a translated shader that never ends), Metal reports no error at all: 2026-11-07 the game sat
    with GPU 0% for five minutes, WindowServer starved and the Mac kernel-panicked through its watchdog. Ending the process
    lets the kernel tear the GPU context down. Shader compiles stall before commit, never between commit and completion,
-   and no frame's GPU work legitimately takes 10 s, so a hit is a hang. */
+   and no frame's GPU work legitimately takes 10 s, so a hit is a hang. A watched commit is counted as it passes bg_gate
+   (q4_commit_gated), so one held there while the app is not active is not timed. The rule itself is gpu_watchdog_rule.h. */
+#include "gpu_watchdog_rule.h"
 static _Atomic uint64_t g_cbw_committed, g_cbw_completed, g_cbw_last_done_ns, g_cbw_last_commit_ns;
 static void *gpu_watchdog_main(void *arg) {
     pthread_setname_np("nvn-gpu-watchdog");
     const uint64_t limit = (uint64_t)(intptr_t)arg * 1000000000ull;
     for (;;) {
         sleep(1);
-        uint64_t committed = atomic_load(&g_cbw_committed), completed = atomic_load(&g_cbw_completed);
-        if (committed == completed) continue;
-        uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), since = atomic_load(&g_cbw_last_done_ns), first = atomic_load(&g_cbw_last_commit_ns);
-        uint64_t ref = since > first ? since : first;   // the newer of: last completion, the commit the outstanding work started with
-        if (ref && now - ref > limit)
+        /* Completed before committed, and the times before the clock: read the other way round, a completion or a
+           commit landing in between made a count below zero or a reference later than "now", and the unsigned
+           difference was a hang of 18446744074 s. */
+        uint64_t completed = atomic_load(&g_cbw_completed), committed = atomic_load(&g_cbw_committed);
+        uint64_t since = atomic_load(&g_cbw_last_done_ns), first = atomic_load(&g_cbw_last_commit_ns);
+        uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), waited = 0;
+        if (gpu_watchdog_hung(committed, completed, since, first, now, limit, &waited))
             MDIE("GPU 看门狗：%llu 个命令缓冲提交后 %.0f 秒没有任何完成（GPU 挂起），停止游戏以保护系统；TOTK_GPU_HANG_S 调整或 =0 关闭",
-                 (unsigned long long)(committed - completed), (now - ref) / 1e9);
+                 (unsigned long long)(committed - completed), waited / 1e9);
     }
     return NULL;
 }
@@ -2998,10 +3011,12 @@ static void gpu_watchdog_start(void) {
         pthread_attr_destroy(&a);
     });
 }
-static void gpu_tag_begin(uint64_t f) {
+static void cbw_commit_begin(void) {   // the watchdog's count of a commit whose completion calls gpu_tag_done
     gpu_watchdog_start();
     if (atomic_load(&g_cbw_committed) == atomic_load(&g_cbw_completed)) atomic_store(&g_cbw_last_commit_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW));   // nothing outstanding: this commit starts the wait
     atomic_fetch_add(&g_cbw_committed, 1);
+}
+static void gpu_tag_begin(uint64_t f) {   // the frame's GPU time only; the watchdog counts in q4_commit_watched (or gpu_tag_f)
     unsigned k = f % GRING;
     if (atomic_load(&g_gpu[k].frame) != f) { atomic_store(&g_gpu[k].frame, f); atomic_store(&g_gpu[k].ns, 0); atomic_store(&g_gpu[k].pending, 0); atomic_store(&g_gpu[k].t0, UINT64_MAX); atomic_store(&g_gpu[k].t1, 0); }
     atomic_fetch_add(&g_gpu[k].pending, 1);
@@ -3026,7 +3041,7 @@ static void gpu_tag_done(uint64_t f, double g0, double g1) {
     }
     atomic_fetch_sub(&g_gpu[k].pending, 1);
 }
-static void gpu_tag_f(id<MTLCommandBuffer> cb, uint64_t f) { gpu_tag_begin(f); [cb addCompletedHandler:^(id<MTLCommandBuffer> c) { gpu_tag_done(f, c.GPUStartTime, c.GPUEndTime); }]; }
+static void gpu_tag_f(id<MTLCommandBuffer> cb, uint64_t f) { cbw_commit_begin(); gpu_tag_begin(f); [cb addCompletedHandler:^(id<MTLCommandBuffer> c) { gpu_tag_done(f, c.GPUStartTime, c.GPUEndTime); }]; }
 void gpu_tag(id<MTLCommandBuffer> cb) { gpu_tag_f(cb, atomic_load(&g_cur_frame)); }
 double mtl_gpu_ms(uint64_t f) {
     unsigned k = f % GRING;
@@ -3122,7 +3137,7 @@ static void mtl_sub_split_done(dispatch_semaphore_t completed) {
     if (early) { w0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); rs_sync(); fc1 = fc0 + (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - w0); }   // fc1 - fc0: the wait, as before
     cb_submit_label(g_cb, gpu_f, "main-mid", fence_next, tlid);
     [g_cb endCommandBuffer];
-    q4_commit(g_cb, o);
+    q4_commit_watched(g_cb, o);
     g_cb = next;
     [g_cb beginCommandBufferWithAllocator:g_alloc4[g_alloc_cur]];
     g_sub_chunks++; g_chunk_commits++; g_chunk_mark = g_stat_draw;
@@ -3280,7 +3295,7 @@ uint64_t mtl_sub_commit(void) {
     g_vr_native_slots = nil;
     cb_submit_label(g_cb, gpu_f, "main-final", fence, tlid);
     [g_cb endCommandBuffer];
-    q4_commit(g_cb, o);
+    q4_commit_watched(g_cb, o);
     if (nogpu()) g_ev.signaledValue = fence; else [g_q4 signalEvent:g_ev value:fence];
     dead_put_flush();   // textures created for finalized serials: released once this submission completes
     stor_sweep(fence);   // TOTK: storage-shared textures nobody held for a while
