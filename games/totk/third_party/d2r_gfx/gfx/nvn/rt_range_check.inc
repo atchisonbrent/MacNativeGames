@@ -9,6 +9,7 @@ static uint64_t g_rr_frame,g_rr_dirty,g_rr_load,g_rr_store,g_rr_reg,g_rr_ser;
 static id<MTLTexture> g_rr_initial[2];
 static tex_t g_rr_t[2];
 static void rr_copy(id<MTLTexture> a,id<MTLTexture> b) {
+    hdr_shadow_invalidate(b);
     [blit()copyFromTexture:a sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)sourceSize:MTLSizeMake(a.width,a.height,1)toTexture:b destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
 }
 static void rr_begin(void) {

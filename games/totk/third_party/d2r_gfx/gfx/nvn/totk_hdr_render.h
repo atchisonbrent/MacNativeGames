@@ -1,6 +1,6 @@
 /* Included by nvn_mtl.m after its texture, encoder and residency helpers. */
 static pthread_mutex_t g_hdr_mu = PTHREAD_MUTEX_INITIALIZER;
-static struct { uint64_t serial, frame; id<MTLTexture> texture; float ui_white,peak; } g_hdr_swap[8];
+static struct { uint64_t serial, frame; id<MTLTexture> texture, base; float ui_white,peak; } g_hdr_swap[8];
 static unsigned g_hdr_nswap;
 static __thread float t_hdr_present_white=1,t_hdr_present_peak=1;
 static int hdr_on(void) {
@@ -26,6 +26,23 @@ static id<MTLTexture> hdr_swap_texture(uint64_t serial, uint64_t frame,float *wh
         pthread_mutex_unlock(&g_hdr_mu); }
     return result;
 }
+/* Transfer pixels, not just a reference to a reusable serial-indexed texture.
+ * The spare belongs to a retired, non-busy ring slot. Both textures stay resident;
+ * capture validates its size/format before writing the spare on the same queue. */
+static id<MTLTexture> hdr_swap_take(uint64_t serial,uint64_t frame,id<MTLTexture> base,id<MTLTexture> spare,float *white,float *peak) {
+    id<MTLTexture> result=nil;
+    if(!hdr_ring_on() || !atomic_load(&g_hdr_frame_enabled))return nil;
+    pthread_mutex_lock(&g_hdr_mu);
+    for(unsigned i=0;i<g_hdr_nswap;i++)if(g_hdr_swap[i].serial==serial && g_hdr_swap[i].frame==frame && g_hdr_swap[i].base==base) {
+        result=g_hdr_swap[i].texture;
+        if(result) {
+            *white=g_hdr_swap[i].ui_white;*peak=g_hdr_swap[i].peak;
+            g_hdr_swap[i].texture=spare;g_hdr_swap[i].base=nil;g_hdr_swap[i].frame=UINT64_MAX;
+        }
+        break;
+    }
+    pthread_mutex_unlock(&g_hdr_mu);return result;
+}
 /* The compose is the only origin of new HDR data. Propagate its FP16
  * companion through draws that consume it, then keep using it for UI blending.
  * Resource identity + current frame prevent unrelated R11 textures being upgraded. */
@@ -48,7 +65,8 @@ static void hdr_prepare_draw(NvProg *pr) {
         if(hdr_shadow_find((__bridge id<MTLTexture>)raw)){linked=YES;break;}
     }
     if(!origin && !linked)return;
-    if(hdr_shadow_make(dst))g_hdr_draw_native=1;
+    /* Intercepts below may consume a pending clear without opening a pass. */
+    if(hdr_shadow_make_draw(dst))g_hdr_draw_native=1;
 }
 /* Preserve the float canvas before the exact final copy writes to the 8-bit
  * sRGB swapchain. Never promote arbitrary guest textures or their CPU storage. */
@@ -67,7 +85,7 @@ static void hdr_capture(NvProg *pr) {
        S.vp[0][2]!=(float)src.width || S.vp[0][3]!=(float)src.height || (S.color.blend_en&1) || S.ds.dt || S.ds.st)return;
     rp_end();blit_close();rs_sync();
     id<MTLTexture> out=hdr_swap_texture(R.rt.color[0]->serial,UINT64_MAX,NULL,NULL);
-    if(!out || out.width!=dst.width || out.height!=dst.height) {
+    if(!out || out.width!=dst.width || out.height!=dst.height || out.pixelFormat!=MTLPixelFormatRGBA16Float || !(out.usage&MTLTextureUsageRenderTarget)) {
         MTLTextureDescriptor *d=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:dst.width height:dst.height mipmapped:NO];
         d.storageMode=MTLStorageModePrivate;d.usage=MTLTextureUsageShaderRead|MTLTextureUsageRenderTarget;
         if(out)defer_obj_release(out);
@@ -76,7 +94,9 @@ static void hdr_capture(NvProg *pr) {
         MLOG("[hdr] float swapchain %llu: %lux%lu",R.rt.color[0]->serial,(unsigned long)dst.width,(unsigned long)dst.height);
     }
     /* A render copy preserves the FP16 canvas, including negative wide-gamut RGB.
-     * present_encode uses the current viewport below, with no output upscale. */
+     * present_encode uses the current viewport below, with no output upscale.
+     * This private full-screen triangle has no guest scissor, blend or discard;
+     * matching extents therefore overwrite every pixel without a clear. */
     static id<MTLRenderPipelineState> pso;
     if(!pso) {
         NSString *msl=totk_hdr_copy_source();
@@ -84,11 +104,14 @@ static void hdr_capture(NvProg *pr) {
         MTLRenderPipelineDescriptor *pd=[MTLRenderPipelineDescriptor new];pd.vertexFunction=[l newFunctionWithName:@"vs"];pd.fragmentFunction=[l newFunctionWithName:@"fs"];pd.colorAttachments[0].pixelFormat=MTLPixelFormatRGBA16Float;
         pso=[g_dev newRenderPipelineStateWithDescriptor:pd error:&e];if(!pso)MDIE("HDR copy pipeline: %s",e.localizedDescription.UTF8String);
     }
-    MTL4RenderPassDescriptor *pd=[MTL4RenderPassDescriptor new];pd.colorAttachments[0].texture=out;pd.colorAttachments[0].loadAction=MTLLoadActionClear;pd.colorAttachments[0].clearColor=MTLClearColorMake(0,0,0,1);pd.colorAttachments[0].storeAction=MTLStoreActionStore;
+    MTL4RenderPassDescriptor *pd=[MTL4RenderPassDescriptor new];pd.colorAttachments[0].texture=out;pd.colorAttachments[0].loadAction=hdr_capture_load_on() && src.width==out.width && src.height==out.height?MTLLoadActionDontCare:MTLLoadActionClear;pd.colorAttachments[0].clearColor=MTLClearColorMake(0,0,0,1);pd.colorAttachments[0].storeAction=MTLStoreActionStore;
+    hdr_copy_note(HDR_COPY_CAPTURE,0,src.width,src.height);
+    hdr_copy_note(HDR_COPY_CLEAR,pd.colorAttachments[0].loadAction==MTLLoadActionDontCare,out.width,out.height);
+    pt_mark(g_cb,'h',pd);
     id<MTL4RenderCommandEncoder> en=[g_cb renderCommandEncoderWithDescriptor:pd];
     [en barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];
     [g_bloomq_args setTexture:src.gpuResourceID atIndex:0];[en setArgumentTable:g_bloomq_args atStages:MTLRenderStageFragment];
     [en setViewport:(MTLViewport){0,0,src.width,src.height,0,1}];[en setRenderPipelineState:pso];[en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];m4_end(en);
-    pthread_mutex_lock(&g_hdr_mu);g_hdr_swap[slot].frame=atomic_load(&g_cur_frame);g_hdr_swap[slot].ui_white=g_hdr_frame_uniform.v[3];g_hdr_swap[slot].peak=g_hdr_frame_peak;pthread_mutex_unlock(&g_hdr_mu);
+    pthread_mutex_lock(&g_hdr_mu);g_hdr_swap[slot].base=dst;g_hdr_swap[slot].frame=atomic_load(&g_cur_frame);g_hdr_swap[slot].ui_white=g_hdr_frame_uniform.v[3];g_hdr_swap[slot].peak=g_hdr_frame_peak;pthread_mutex_unlock(&g_hdr_mu);
     static uint64_t n;if(++n%1200==1)MLOG("[hdr] preserved float canvas before SDR copy (%llu frames)",n);
 }

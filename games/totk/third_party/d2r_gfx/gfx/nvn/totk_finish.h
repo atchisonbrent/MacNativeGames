@@ -117,6 +117,7 @@ static int fin_draw(__unsafe_unretained NvShader *fs) {
     rp_end(); blit_close(); rs_sync();
     pt_mark(g_cb, 'F', nil);
     id<MTLTexture> src = g_fin.src, dst = g_fin.dst; g_fin.src = nil; g_fin.dst = nil;
+    hdr_shadow_external(dst);
     int smoothed = g_fin.smaa && smaa_encode(g_cb,src,dst,g_fin.smaa_slot);
     if(!smoothed&&g_fin.fxaa_quality)smoothed=fxaa_quality_encode(g_cb,src,dst,g_fin.smaa_slot);
     if (g_fin.skipped && !smoothed) fin_pass(src, dst, pct);   // FXAA off, or SMAA failed: a valid picture in either case
