@@ -23897,7 +23897,11 @@ void botw_tiny_commit(void) {   // in mtl_sub_commit, after the last render pass
    lands. A learned target not rendered for LATE_IDLE submissions gives its slot to the next one (a recreated mask has
    a new serial).
    TOTK_BOTW_LATE_WB=0 keeps the waiting write-back. */
-#define LATE_MAX 8
+#ifndef LATE_MAX
+#define LATE_MAX 16   /* 8 until 2026-11-14: on 1.9.0 in the open world the eight went to per-frame targets first, and the two
+                         64x64 cube maps the game renders every tenth frame (6 faces, 4 levels) never got one: the main thread
+                         waited for their rendering at each, 3 to 8 ms without HDR and 10 ms with it. Eleven are in use there. */
+#endif
 #define LATE_LEARN 120
 #define LATE_BYTES (1u << 20)
 #define LATE_RED 123   /* RED_ONCE slot */
@@ -23911,7 +23915,7 @@ static late_cand g_late_cand[16];
 static _Atomic int g_late_n;   /* learned slots */
 static late_job g_late_sub[LATE_MAX]; static __strong id<MTLTexture> g_late_tex[LATE_MAX]; static int g_late_nsub;   /* submit thread */
 static __strong id<MTLBuffer> g_late_buf[LATE_MAX][LATE_SLOTS]; static uint64_t g_late_bfence[LATE_MAX][LATE_SLOTS];   /* submit thread: a slot per submission */
-static late_job *g_late_fly[64]; static int g_late_nfly;   /* copied out, not landed yet */
+static late_job *g_late_fly[LATE_MAX * 8]; static int g_late_nfly;   /* copied out, not landed yet */
 static uint8_t *g_late_post[LATE_MAX]; static size_t g_late_post_n[LATE_MAX]; static uint64_t g_late_lseq[LATE_MAX];   /* (g_late_mu) edge bytes after the last landing of each target, and the landings so far */
 static _Atomic uint64_t g_late_landed, g_late_skipped, g_late_freed, g_late_bytes, g_late_ns;
 static _Atomic uint64_t g_late_last[LATE_MAX];   /* the submission that last rendered each learned target */
@@ -24012,7 +24016,7 @@ void botw_late_commit(void) {
         if (!buf) { buf = g_late_buf[r][s] = [g_dev newBufferWithLength:LATE_BYTES options:MTLResourceStorageModeShared]; if (buf) { res_add(buf); res_commit(); } }
         late_job *c = buf ? malloc(sizeof *c) : NULL;
         int ok = 0;
-        if (c) { *c = *j; pthread_mutex_lock(&g_late_mu); if ((ok = g_late_nfly < 64)) g_late_fly[g_late_nfly++] = c; pthread_mutex_unlock(&g_late_mu); }
+        if (c) { *c = *j; pthread_mutex_lock(&g_late_mu); if ((ok = g_late_nfly < LATE_MAX * 8)) g_late_fly[g_late_nfly++] = c; pthread_mutex_unlock(&g_late_mu); }
         if (!ok) { free(c); free(j->edge); j->edge = NULL; late_unclaim(j->t.serial, fence); continue; }
         j->edge = NULL;   /* owned by the job in flight */
         g_late_bfence[r][s] = fence;
@@ -24064,6 +24068,17 @@ int botw_late_filter(void **lv, int nl) {
         if (e->late_fence && e->late_fence == e->fence) { wb_ent_free(e); atomic_fetch_add(&g_late_freed, 1); continue; }
         uint64_t need = e->fence > e->stage_fence ? e->fence : e->stage_fence;
         if (need > done && late_bytes(&e->t)) late_count(e->t.serial);
+        if (need > done) {   /* TOTK_BOTW_LATE_LOG=1 (diagnostic): which renderings the flush still waits for, at a target's 1st, 100th and every 1000th wait */
+            static int lg = -1; if (lg < 0) lg = getenv("TOTK_BOTW_LATE_LOG") != NULL;
+            if (lg) { static uint64_t seen[64], cnt[64]; static int ns; static uint64_t total; int q;
+                pthread_mutex_lock(&g_late_mu);
+                for (q = 0; q < ns && seen[q] != e->t.serial; q++) {}
+                if (q == ns && ns < 64) { seen[ns] = e->t.serial; cnt[ns++] = 0; }
+                uint64_t c = q < 64 ? ++cnt[q] : 0; total++;
+                pthread_mutex_unlock(&g_late_mu);
+                if (c == 1 || c == 100 || (c && c % 1000 == 0)) MLOG("[late-log] waits for ser=%llu %ux%u nvnfmt=%#x lv%u layers %u target %d bytes %zu late_bytes %zu staged %d: %llu times (all waits %llu, learned slots %d)",
+                    (unsigned long long)e->t.serial, e->t.d.width, e->t.d.height, e->t.d.format, e->t.d.levels, e->t.L.layers, e->t.d.target, (size_t)e->t.L.size, late_bytes(&e->t), (int)WB_STAGED(e),
+                    (unsigned long long)c, (unsigned long long)total, atomic_load(&g_late_n)); } }
         list[k++] = e;
     }
     return k;
