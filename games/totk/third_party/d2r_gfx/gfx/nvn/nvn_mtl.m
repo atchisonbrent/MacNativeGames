@@ -20359,6 +20359,18 @@ static void cadence_note(double tt, int interp) {
         double tick = 1000.0 / hz; int held = 0; for (int i = 0; i < N; i++) held += a[i] > 1.5 * tick;
         MLOG("上屏节奏（近 %d 张，至帧 %llu，显示器 %d Hz）：间隔 p50 %.2f / p95 %.2f / 最大 %.2f ms；多停一次刷新以上 %d 次（%.1f%%）；其中补帧 %d 张；系统丢弃 %llu 张",
              N, (unsigned long long)atomic_load(&g_cur_frame), hz, a[N / 2], a[N * 95 / 100], a[N - 1], held, 100.0 * held / N, ni, (unsigned long long)dropped);
+        /* Whether the pictures sit on the display's fixed refresh grid or between its ticks (a variable refresh display
+           showing each picture when it arrives): the share of intervals within 0.3 ms of a whole number of refreshes,
+           and where the intervals fall, in 1 ms steps from 6 ms. On a fixed grid nearly all are on it and the steps
+           used are the whole refreshes only. */
+        int grid = 0, bins[21] = {0};
+        for (int i = 0; i < N; i++) {
+            double k = floor(a[i] / tick + 0.5); grid += k >= 1 && fabs(a[i] - k * tick) <= 0.3;
+            int b = (int)floor(a[i]) - 6; bins[b < 0 ? 0 : b > 20 ? 20 : b]++;
+        }
+        char hist[256]; int o = 0;
+        for (int b = 0; b <= 20 && o < (int)sizeof hist - 24; b++) if (bins[b]) o += snprintf(hist + o, sizeof hist - (size_t)o, " %d%s:%d", b + 6, b == 20 ? "+" : "", bins[b]);
+        MLOG("present cadence: %d of %d intervals on the %d Hz grid (%.1f%%); intervals by ms:%s", grid, N, hz, 100.0 * grid / N, hist);
         n = ni = 0; dropped = 0;
     }
     pthread_mutex_unlock(&mu);
