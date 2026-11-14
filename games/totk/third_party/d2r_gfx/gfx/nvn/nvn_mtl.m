@@ -7567,6 +7567,10 @@ static NvShader *shader_load_mode(NSString *pc, int stage, int archive_compute) 
             NSError *err = nil; id<MTLLibrary> hl = modified ? totk_msl_library(modified, &err) : nil;
             id<MTLFunction> hf = hl ? [hl newFunctionWithName:j[@"entry"]] : nil;
             if (hf) { o->hdr_fn = hf; fn_note_src(hf, modified); o->hdr_compose = kind;
+                if(kind==1) { static dispatch_once_t once;dispatch_once(&once,^{
+                    int v=totk_hdr_compose_variant();
+                    MLOG("[hdr] compose: %s",v==0?"0 baseline (original source)":v==1?"1 matrix reduction (5af685f0)":v==3?"3 reduced arithmetic, donor on every pixel (measurement)":"2 reduced arithmetic + dark donor identity");
+                }); }
                 MLOG("[hdr] %s: HDR twin ready (%s)", o->key, kind == 1 ? "RenoDX-style scene + bloom tone map" : "HDR EASU ceiling removed"); }
             else { atomic_store(&g_hdr_shader_failed, 1);
                 MLOG("[hdr] unsupported %s shader layout / compile, HDR stays off: %s", kind == 1 ? "compose" : "postprocess",

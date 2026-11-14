@@ -4,8 +4,19 @@
  */
 #pragma once
 #import <Foundation/Foundation.h>
+#include <stdlib.h>
+#include <string.h>
+#include "totk_hdr_compose_fast.h"
 #define TOTK_HDR_COMPOSE_KEY "0ac9a54938974396134d911dc0f29c79ce43e3d8cd50b11ee8b85a48ead6d2a5-"
 #define TOTK_HDR_POST_KEY "ac58fc18eda5f3878b16074dc28cd441644a66710f1b73954d39e57ac357561b-"
+static int totk_hdr_compose_variant(void) {
+    /* 0: original; 1: frozen matrix reduction; 2 (default): reduced arithmetic;
+     * 3 (measurement only): 2 with the donor step taken on every pixel, which is
+     * what a scene with nothing below the pivot costs. */
+    static int variant;static dispatch_once_t once;
+    dispatch_once(&once,^{const char *e=getenv("TOTK_HDR_COMPOSE");variant=e && !strcmp(e,"0")?0:e && !strcmp(e,"1")?1:e && !strcmp(e,"3")?3:2;});
+    return variant;
+}
 static NSString *totk_hdr_scene_msl(void) {
     return @"\n"
         "// Scene tone mapping: C1 extension of the original exponential toe, SDR hue /\n"
@@ -133,7 +144,14 @@ static inline NSString *totk_hdr_compose_source(NSString *source) {
        ![source containsString:@"float _73 = _67 + _61;"] ||
        ![source containsString:@"(*spvDescriptorSet0.fp_c3)._m0[0].y"])return nil;
     NSString *s=totk_hdr_uniform(source);if(!s)return nil;
-    s=[s stringByReplacingOccurrencesOfString:@"using namespace metal;" withString:[@"using namespace metal;\n" stringByAppendingString:totk_hdr_scene_msl()]];
+    int variant=totk_hdr_compose_variant();
+    NSString *helpers=variant==0?totk_hdr_scene_msl():variant==1?totk_hdr_scene_fast_msl():totk_hdr_scene_reduced_msl();
+    if(variant==3) {
+        NSString *dark=@"if(!(y<=chroma.z && max(raw.r,max(raw.g,raw.b))<=chroma.z)) {";
+        if(![helpers containsString:dark])return nil;
+        helpers=[helpers stringByReplacingOccurrencesOfString:dark withString:@"{"];
+    }
+    s=[s stringByReplacingOccurrencesOfString:@"using namespace metal;" withString:[@"using namespace metal;\n" stringByAppendingString:helpers]];
     NSString *body=@"    if (hdrConfig.display.x > 0.5) {\n"
       "        out.m_34.xyz = hdr_scene_map(float3(_63*hdrConfig.color.y+_57,_65*hdrConfig.color.y+_59,_67*hdrConfig.color.y+_61), float3(0.2989000082,(*spvDescriptorSet0.fp_c1)._m0[0].x,(*spvDescriptorSet0.fp_c1)._m0[0].y), (*spvDescriptorSet0.fp_c1)._m0[0].z, (*spvDescriptorSet0.fp_c3)._m0[0].xy, hdrConfig.display.y, hdrConfig.tone, hdrConfig.color, hdrConfig.art) * hdrConfig.display.z;\n    }\n";
     return [s stringByReplacingOccurrencesOfString:anchor withString:[body stringByAppendingString:anchor]];

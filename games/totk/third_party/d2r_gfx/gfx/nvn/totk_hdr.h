@@ -80,9 +80,13 @@ static inline float totk_hdr_uniform_snapshot(TotkHDRUniform *out,float headroom
     float peak=fmaxf(headroom,1);
     if(p[TOTK_HDR_PEAK]>0)peak=fminf(peak,fmaxf(p[TOTK_HDR_PEAK],1));
     float scene=fminf(p[TOTK_HDR_GAME_WHITE],peak),ui=fminf(p[TOTK_HDR_UI_WHITE],peak);
+    /* Draw-invariant C1 extension, in the two unused art slots. The baseline
+     * shader ignores these; variants 1 and 2 reuse them for all channels. */
+    float pivot=p[TOTK_HDR_SDR_PIVOT],slope=expf(-pivot);
+    float curve=pivot<0.001f?pivot*(1.0f-0.5f*pivot+pivot*pivot/6.0f):1.0f-slope;
     *out=(TotkHDRUniform){{enabled?1.0f:0.0f,peak/scene,scene/ui,ui,
         exp2f(p[TOTK_HDR_EXPOSURE]),p[TOTK_HDR_HIGHLIGHTS],p[TOTK_HDR_SHADOWS],p[TOTK_HDR_CONTRAST],
         p[TOTK_HDR_SATURATION],p[TOTK_HDR_BLOOM],p[TOTK_HDR_SDR_PIVOT],p[TOTK_HDR_HUE],
-        p[TOTK_HDR_PURITY],p[TOTK_HDR_VANILLA_SATURATION],0,0}};
+        p[TOTK_HDR_PURITY],p[TOTK_HDR_VANILLA_SATURATION],curve,slope}};
     return peak;
 }
