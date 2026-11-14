@@ -1,6 +1,6 @@
 # What this branch changes, and why
 
-Ten changes to the Metal backend (`games/totk/third_party/d2r_gfx/gfx/nvn/`) on top of MacNativeGames `f9f7aa8`
+Eleven changes to the Metal backend (`games/totk/third_party/d2r_gfx/gfx/nvn/`) on top of MacNativeGames `f9f7aa8`
 (upstream `main` of 2026-11-13), made while running Tears of the Kingdom 1.4.3 and Breath of the Wild 1.9.0 on an M6
 Mac mini connected to an LG G3 (3840x2160, HDR, 40-120 Hz). One commit per change, each standing on the ones before
 it. Nothing here has been sent upstream. Upstream `main` has moved on since `f9f7aa8` and `nvn_mtl.m` no longer merges
@@ -20,23 +20,29 @@ This file is kept up to date as the branch changes; the log at the end says what
 | 8 | gfx(present): a picture without its scene is not shown for a few frames (Breath of the Wild) | A frame that drew neither the scene nor a menu's still of it, right after one that did, is not presented: the last picture stays, for at most 8 frames and 100 ms. `TOTK_SCENE_HOLD` (frames; 8 on BOTW, 0 elsewhere), `TOTK_SCENE_HOLD_LOG` | Opening the weapon wheel or the pause menu in BOTW 1.9.0, the game draws up to three frames with only the HUD on a cleared canvas: a black flash of about 25 ms at every opening |
 | 9 | gfx(hdr): the FP16 surface stays through frames without an HDR picture | While HDR is on the layer stays FP16 / EDR, and a picture without an HDR companion is decoded into it at SDR white. `TOTK_HDR_SURFACE_KEEP=0` is the behaviour before | Such a frame switched the layer to BGRA8 and back, draining the GPU each time: in BOTW 1.9.0 at every opening and closing of the weapon wheel |
 | 10 | gfx(write-back): sixteen learned targets instead of eight (Breath of the Wild) | `LATE_MAX` 8 to 16; `TOTK_BOTW_LATE_LOG=1` lists the renderings the game's flush still waits for | In the open world the eight slots went to per-frame targets, and two cube maps the game renders every tenth frame never got one: every tenth frame took 13 ms instead of 8.6 (20 instead of 10.1 with HDR). Frame time p95 12.5 to 9.6 ms, with HDR 19.7 to 11.3 ms. `LATE_MAX` is still 8 in upstream `main` at `2f81ef5e` |
+| 11 | gfx(present): a frontend's overlay box drawn into the presented picture | `mtl_front_overlay()` takes a premultiplied BGRA bitmap and a position in drawable pixels; the present pass draws it over the picture with alpha blending, in a pipeline of its own. Staging in `front_overlay.h`, with a GPU-free test | On a variable-refresh display macOS varies the refresh only while the game's layer is the one thing on the screen that changes. A frontend's statistics box redrawing ten times a second in a layer above the game kept the display on its fixed grid: 21.8% of pictures stayed up for a second refresh at about 94 fps, against 0.17% with the box drawn into the picture and 0.27% with no box |
 
 Commit 6 stands on its own in what it changes, and is the one most worth having. Commit 10 is two lines and stands on
-its own too.
+its own too. Commit 11 does nothing until a frontend calls it.
 
 ## What has and has not been checked
 
-Checked: `make -C games/totk/third_party/d2r_gfx/gfx/nvn/tests run` passes at commits 4 to 7 and at 10. Cores built
+Checked: `make -C games/totk/third_party/d2r_gfx/gfx/nvn/tests run` passes at commits 4 to 7, at 10 and at 11. Cores built
 from commits 1 to 6 (TOTK 1.4.3) and 1 to 10 (BOTW 1.9.0) run on the M6: both games survive 30 s marked not active;
 BOTW HDR engages on every gameplay frame. With commits 8 to 10, at 2560x1440 with MetalFX to 3840x2160, with and
 without HDR: no dark picture and no switch of the surface at the weapon wheel or the pause menu, window shots of the
-wheel with and without HDR agree, and the tenth-frame stall is gone.
+wheel with and without HDR agree, and the tenth-frame stall is gone. With commit 11, cores of both games built from
+commits 1 to 11, 3840x2160 with HDR: a 691x502 box updated ten times a second shows in window shots, translucent over
+the picture, also after 6 s marked not active; pictures held for a second refresh as in the table (TOTK at about
+115 fps: 0.03% with the box, 0 without); frame time p50 / p95 10.68 / 11.26 ms with the box against 10.64 / 11.19
+without (BOTW).
 
 Not checked:
 
 - iOS, and every game but the two named.
-- TOTK on a core built with commits 7 to 10. Commits 7 and 9 change what TOTK's HDR does or uses (9 is on for it by
-  default); 8 and 10 are off or absent there.
+- TOTK on a core built with commits 7 to 10 beyond two runs of two minutes in one cave, with HDR, which went without
+  a failure. Commits 7 and 9 change what TOTK's HDR does or uses (9 is on for it by default); 8 and 10 are off or
+  absent there.
 - Commit 8 with a 3840x2160 canvas leaves one dark picture of 4 to 9 ms at each opening of the weapon wheel. Menus
   other than the weapon wheel and the pause menu, cutscenes and loading screens were not looked at one by one: where a
   cut shows neither the scene nor a large still, the last picture stays up to 100 ms longer.
@@ -47,6 +53,11 @@ Not checked:
   to 3840x2160 it ran at about 110 fps where the same scene held 120 without HDR.
 - BOTW 1.9.0 HDR through MacNativeGames' own app: its settings panel has no HDR row for BOTW, so there it needs
   `TOTK_HDR=1` or `hdr.txt`.
+- Commit 10 for the first half minute after a save loads: the stall is still there until the targets are learned
+  (frame time p95 19.7 ms with HDR for about 35 s in one place, 11.2 after).
+- Commit 11 on a BGRA8 drawable (every run had the FP16 surface), with a box that reaches past the drawable, with
+  frame interpolation, and for what its first use costs (a shader library and a pipeline are built in the present
+  pass, once per drawable format).
 - Everything was measured on one Mac and one television.
 
 ## How it was made
@@ -58,3 +69,4 @@ The changes were written with Claude (Anthropic) and, for parts, GPT through Cod
 
 - 2026-11-14: branch published. Commits 1 to 7 on `f9f7aa8`.
 - 2026-11-14: commits 8 to 10 (the menu flash, the HDR surface, the tenth-frame stall), merged from the series branch.
+- 2026-11-14: commit 11 (a frontend's overlay box drawn into the presented picture), merged from the series branch.
