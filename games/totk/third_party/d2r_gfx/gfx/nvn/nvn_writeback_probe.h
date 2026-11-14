@@ -161,7 +161,18 @@ int mtl_probe_writeback(void) {
                            first and last pages hold neighbour bytes the CPU writes; only its own bytes count there. */
             size_t off = 4096; uint8_t *lm = backing + off; size_t pg = (size_t)getpagesize();
             mask.mem = lm;
-            for (int k = 0; k < LATE_LEARN; k++) late_count(mask.serial);
+            /* Learning (late_learn.h) as late_count asks for it: waits in one frame are not a run, waits in
+               LATE_LEARN_RUN frames are; with the run rule off (TOTK_BOTW_LATE_RUN=0) it takes LATE_LEARN waits. */
+            pthread_mutex_lock(&g_late_mu); unsigned run_need = late_run_need(); pthread_mutex_unlock(&g_late_mu);
+            uint64_t f0 = atomic_load(&g_cur_frame);
+            if (run_need > 1 && 3 * run_need < LATE_LEARN) {
+                for (unsigned k = 0; k < 2 * run_need; k++) late_count(mask.serial);
+                if (late_ring(mask.serial) >= 0) MDIE("late write-back probe: the waits of one frame learned the mask");
+                for (unsigned k = 1; k < run_need; k++) {
+                    if (late_ring(mask.serial) >= 0) MDIE("late write-back probe: the mask was learned in %u frames, short of %u", k, run_need);
+                    atomic_store(&g_cur_frame, f0 + k); late_count(mask.serial); }
+                atomic_store(&g_cur_frame, f0);
+            } else for (int k = 0; k < LATE_LEARN; k++) late_count(mask.serial);
             if (late_ring(mask.serial) < 0) MDIE("late write-back probe: the mask was not learned");
             checked++;
             for (int scenario = 0; scenario < 4; scenario++) {   /* 0 plain, 1 neighbours on the edge pages written, 2 an own byte on an edge page, 3 an own byte on a full page */
