@@ -48,8 +48,8 @@ held, as before. The tests pass at 12; six mutations of the counting each fail `
 Not checked:
 
 - iOS, and every game but the two named.
-- TOTK on a core built with commits 7 to 10 beyond two runs of two minutes in one cave, with HDR, which went without
-  a failure. Commits 7 and 9 change what TOTK's HDR does or uses (9 is on for it by default); 8 and 10 are off or
+- TOTK on a core built with commits 7 to 12 beyond scripted runs of 30 s to two minutes in one cave, with HDR, which
+  went without a failure. Commits 7 and 9 change what TOTK's HDR does or uses (9 is on for it by default); 8 and 10 are off or
   absent there.
 - Commit 8 with a 3840x2160 canvas leaves one dark picture of 4 to 9 ms at each opening of the weapon wheel. Menus
   other than the weapon wheel and the pause menu, cutscenes and loading screens were not looked at one by one: where a
@@ -57,8 +57,10 @@ Not checked:
 - Commit 9 with frame interpolation, and with an SDR picture in an `_sRGB` format (the path is there, nothing here
   produced one).
 - Commit 10 anywhere but one place in the open world, and for memory: each slot in use holds up to four 1 MiB buffers.
-- BOTW HDR for more than a few minutes, or outside the opening area when it was measured. With 2560x1440 and MetalFX
-  to 3840x2160 it ran at about 110 fps where the same scene held 120 without HDR.
+- BOTW HDR against a reference, and over a long session by measurement: it is what the game is played in on this
+  setup, the scripted runs last under a minute in one place of the open world, and nothing compared its colours or
+  brightness with the console's picture. With 2560x1440 and MetalFX to 3840x2160 it runs at about 95 to 110 fps
+  where the same scene holds 120 without HDR.
 - BOTW 1.9.0 HDR through MacNativeGames' own app: its settings panel has no HDR row for BOTW, so there it needs
   `TOTK_HDR=1` or `hdr.txt`.
 - Commit 12 beyond loading one save into one place: entering and leaving a shrine, a second load in one session
