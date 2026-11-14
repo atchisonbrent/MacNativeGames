@@ -20023,6 +20023,77 @@ int mtl_display_hz(void) {
 static _Atomic uint64_t g_present_stall_ns;   // 单测用：出图线程每次出图前额外停顿（模拟 drawable 迟迟不可用） | For unit tests: an extra pause before each present on the present thread (simulating a drawable that stays unavailable)
 static CAMetalLayer *g_present_layer_resident;
 void mtl_present_test_stall(uint64_t ns) { g_present_stall_ns = ns; }
+#include "front_overlay.h"
+static front_overlay_stage g_front_stage = FRONT_OVERLAY_STAGE_INIT;
+static front_overlay_slot g_front_slot[4];
+static uint64_t g_front_key[4];
+static id<MTLBuffer> g_front_uv[3];
+static id<MTLRenderPipelineState> g_front_pso, g_front_pso_before; static MTLPixelFormat g_front_fmt;
+
+/* The slot owns this registration. An asynchronous grab also captures the owner
+ * until completion, so replacing slot 3 cannot release an in-flight texture. */
+@interface NvFrontOverlayTexture : NSObject {
+@public
+    id<MTLTexture> texture;
+}
+@end
+@implementation NvFrontOverlayTexture
+- (void)dealloc { res_remove(texture); }
+@end
+static NvFrontOverlayTexture *g_front_tex[4];
+
+int mtl_front_overlay(const void *bgra, int w, int h, int bytes_per_row, int x, int y) {
+    front_overlay_change change;
+    if (!front_overlay_set(&g_front_stage, bgra, w, h, bytes_per_row, x, y, &change)) return 0;
+    const char *event = change.kind == FRONT_OVERLAY_ARRIVED ? "arrived" :
+        change.kind == FRONT_OVERLAY_RESIZED ? "resized" : change.kind == FRONT_OVERLAY_REMOVED ? "removed" : NULL;
+    if (event) MLOG("[front-overlay] %s: %dx%d at %d,%d", event, change.box.w, change.box.h, change.box.x, change.box.y);
+    return 1;
+}
+
+/* Slots 0..2 are used only after their previous GPU work has completed. Slot 3
+ * gets an immutable texture per uploaded generation because grabs are asynchronous.
+ * The stage mutex protects only a CPU snapshot, never allocation or Metal work. */
+static int front_overlay_prepare(int slot, id<MTLTexture> dst, MTLViewport *vp, float uv[8]) {
+    front_overlay_slot *s = &g_front_slot[slot];
+    if (front_overlay_snapshot(&g_front_stage, s) < 0) {   // no memory for the copy: this picture goes without the box
+        static int said; if (!said) { said = 1; MLOG("[front-overlay] no memory for a %dx%d box: not drawn", g_front_stage.box.w, g_front_stage.box.h); }
+        return 0;
+    }
+    front_overlay_clip clip;
+    if (!front_overlay_clip_box(s->box, dst.width, dst.height, &clip)) return 0;
+    int residency_changed = 0;
+    if (g_front_key[slot] != s->generation) {
+        id<MTLTexture> old = g_front_tex[slot] ? g_front_tex[slot]->texture : nil;
+        if (!old || slot == 3 || old.width < (NSUInteger)s->box.w || old.height < (NSUInteger)s->box.h) {
+            NSUInteger w = s->box.w, h = s->box.h;
+            if (slot != 3) { w = MAX(w, old.width); h = MAX(h, old.height); }
+            MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                width:w height:h mipmapped:NO];
+            d.usage = MTLTextureUsageShaderRead; d.storageMode = MTLStorageModeShared;
+            NvFrontOverlayTexture *owner = [NvFrontOverlayTexture new];
+            owner->texture = [g_dev newTextureWithDescriptor:d];
+            if (!owner->texture) MDIE("frontend overlay texture allocation failed");
+            res_add(owner->texture);
+            g_front_tex[slot] = owner;
+            residency_changed = 1;
+        }
+        [g_front_tex[slot]->texture replaceRegion:MTLRegionMake2D(0, 0, s->box.w, s->box.h) mipmapLevel:0
+            withBytes:s->pixels bytesPerRow:(NSUInteger)s->box.w * 4];
+        g_front_key[slot] = s->generation;
+    }
+    if (slot < 3 && !g_front_uv[slot]) {
+        g_front_uv[slot] = [g_dev newBufferWithLength:sizeof(float) * 8 options:MTLResourceStorageModeShared];
+        if (!g_front_uv[slot]) MDIE("frontend overlay UV allocation failed");
+        res_add(g_front_uv[slot]);
+        residency_changed = 1;
+    }
+    if (residency_changed) res_commit();   // Include resources created after startup before submission.
+    id<MTLTexture> tex = g_front_tex[slot]->texture;
+    *vp = (MTLViewport){clip.x, clip.y, clip.w, clip.h, 0, 1};
+    front_overlay_uv(clip, (int)tex.width, (int)tex.height, uv);
+    return 1;
+}
 static id<MTLRenderPipelineState> g_blit_lin_pso;   // FP16 target: a picture the sampler hands over linear already (an _sRGB format), copied as it is
 /* The pipeline for the game's picture. An FP16 picture or an FP16 drawable takes the HDR copy, but for an SDR picture on
    the kept FP16 surface (t_hdr_present_sdr): that one is decoded from sRGB to the surface's linear values at SDR white,
@@ -20035,12 +20106,35 @@ static id<MTLRenderPipelineState> present_picture_pso(id<MTLTexture> pic, id<MTL
     MTLPixelFormat f = pic.pixelFormat;
     return g_blit_lin_pso && (f == MTLPixelFormatRGBA8Unorm_sRGB || f == MTLPixelFormatBGRA8Unorm_sRGB) ? g_blit_lin_pso : g_blit_pso;
 }
+/* The frontend overlay's pipeline: a library and a pipeline of its own, so that the first overlay does not rebuild
+   the picture's pipelines and sampler under presents still in flight, and the screenshot path (which draws no overlay)
+   never touches it. Rebuilt when the drawable's format changes; the one before stays alive for a present that was
+   encoded with it and has not completed. Called only by the two present encoders, which run one at a time. */
+static void front_pipeline(MTLPixelFormat format) {
+    if (g_front_pso && g_front_fmt == format) return;
+    BOOL edr = format == MTLPixelFormatRGBA16Float;
+    NSError *e = nil;
+    id<MTLLibrary> lib = [g_dev newLibraryWithSource:totk_hdr_present_source(format, edr, YES) options:edr ? totk_precise_opts() : nil error:&e];
+    if (!lib) MDIE("frontend overlay shader failed: %s", e.localizedDescription.UTF8String);
+    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+    pd.vertexFunction = [lib newFunctionWithName:@"vs"]; pd.fragmentFunction = [lib newFunctionWithName:@"fsfront"];
+    MTLRenderPipelineColorAttachmentDescriptor *color = pd.colorAttachments[0];
+    color.pixelFormat = format;
+    color.blendingEnabled = YES;
+    color.rgbBlendOperation = color.alphaBlendOperation = MTLBlendOperationAdd;
+    color.sourceRGBBlendFactor = color.sourceAlphaBlendFactor = MTLBlendFactorOne;
+    color.destinationRGBBlendFactor = color.destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    id<MTLRenderPipelineState> pso = [g_dev newRenderPipelineStateWithDescriptor:pd error:&e];
+    if (!pso) MDIE("frontend overlay pipeline failed: %s", e.localizedDescription.UTF8String);
+    g_front_pso_before = g_front_pso; g_front_pso = pso; g_front_fmt = format;
+    MLOG("[front-overlay] pipeline for drawable format %lu", (unsigned long)format);
+}
 static void present_pipeline(MTLPixelFormat format, BOOL hdrSource) {
     BOOL hdrAvailable=hdrSource || format==MTLPixelFormatRGBA16Float;
     if (!g_blit_pso || g_blit_fmt != format || g_blit_hdr_source!=hdrAvailable) {
         g_blit_hdr_source=hdrAvailable;g_blit_hdr_pso=nil;g_blit_lin_pso=nil;
         if(getenv("TOTK_HDR") || getenv("TOTK_HDR_CONTROL"))MLOG("[hdr] presentation: format %lu, HDR shader %s, supported %d",(unsigned long)format,hdrAvailable?"on":"off",totk_hdr_available());
-        NSString *source=totk_hdr_present_source(format,hdrAvailable);
+        NSString *source=totk_hdr_present_source(format,hdrAvailable,NO);
         NSError *e = nil;
         id<MTLLibrary> lib = [g_dev newLibraryWithSource:source options:hdrAvailable?totk_precise_opts():nil error:&e];
         if (!lib) MDIE("出图着色器编译失败 %s", e.localizedDescription.UTF8String);
@@ -20291,7 +20385,10 @@ static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTex
     if (memcmp(meta, last_crop, sizeof meta)) { memcpy(last_crop, meta, sizeof meta);
         MLOG("出图裁切：原纹理 %lux%lu，有效 %lu,%lu %lux%lu → 目标 %lux%lu", (unsigned long)src.width, (unsigned long)src.height,
              (unsigned long)cx, (unsigned long)cy, (unsigned long)cw, (unsigned long)ch, (unsigned long)dst.width, (unsigned long)dst.height); }
+    MTLViewport front_vp; float front_uv[8];
+    int front = fps_overlay && front_overlay_prepare(3, dst, &front_vp, front_uv);
     present_pipeline(dst.pixelFormat,hdr_on() && src.pixelFormat==MTLPixelFormatRGBA16Float);
+    if (front) front_pipeline(dst.pixelFormat);
     MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
     // 保持游戏画面宽高比居中，余下留黑边（屏幕比例与游戏不同时不拉伸，如 iPhone 约 19.5:9 对游戏 16:9）；
     // 比例差 < 1%（全屏口径下游戏宽度取 8 的倍数带来的零头，如 1952x900 对 2868x1320 差 0.17%）直接铺满，不留几像素的边
@@ -20334,6 +20431,13 @@ static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTex
         [en setViewport:ovp]; [en setFragmentTexture:g_load_tex[3] atIndex:0]; [en setFragmentBytes:fuv length:sizeof fuv atIndex:0];
         [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     }
+    if (front) {
+        NvFrontOverlayTexture *owner = g_front_tex[3];
+        [en setRenderPipelineState:g_front_pso]; [en setViewport:front_vp];
+        [en setFragmentTexture:owner->texture atIndex:0]; [en setFragmentBytes:front_uv length:sizeof front_uv atIndex:0];
+        [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [cb addCompletedHandler:^(id<MTLCommandBuffer> completed) { (void)completed; (void)owner->texture; }];
+    }
     [en endEncoding];
     return 1;
 }
@@ -20347,7 +20451,10 @@ static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MT
         cx = crop[0]; cy = crop[1]; cw = crop[2]; ch = crop[3];
     }
     if (crop) { atomic_store(&g_pic_big, cw >= 5120 && ch >= 2880 ? 3 : cw >= 3840 && ch >= 2160 ? 2 : cw > 1920 || ch > 1080); atomic_store(&g_out_w, (uint32_t)cw); atomic_store(&g_out_h, (uint32_t)ch); }   // a game frame (interpolated frames come without the crop)
+    MTLViewport front_vp; float front_uv[8];
+    int front = front_overlay_prepare(uv_i, dst, &front_vp, front_uv);
     present_pipeline(dst.pixelFormat,hdr_on() && src.pixelFormat==MTLPixelFormatRGBA16Float);
+    if (front) front_pipeline(dst.pixelFormat);
     double dw = dst.width, dh = dst.height;
     MTLViewport vp = present_viewport(dw, dh, cw, ch);
     int full = vp.originX == 0 && vp.originY == 0 && vp.width == dw && vp.height == dh;
@@ -20398,6 +20505,13 @@ static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MT
         [args setTexture:g_load_tex[uv_i].gpuResourceID atIndex:0];
         [args setAddress:g_load_uv[uv_i].gpuAddress atIndex:0];
         [en setViewport:ovp];
+        [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    }
+    if (front) {
+        memcpy(g_front_uv[uv_i].contents, front_uv, sizeof front_uv);
+        [args setTexture:g_front_tex[uv_i]->texture.gpuResourceID atIndex:0];
+        [args setAddress:g_front_uv[uv_i].gpuAddress atIndex:0];
+        [en setRenderPipelineState:g_front_pso]; [en setViewport:front_vp];
         [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     }
     m4_end(en);

@@ -434,6 +434,16 @@ int mtl_has_window(void);
 int mtl_warm_wait(int timeout_ms);
 int mtl_link_active(void);
 void mtl_present_link_host(int mode);   /* a frontend's wish for the present thread: 0 = wanted, anything else = no wish (nvn_mtl.m link_sync) */
+/* A frontend's own overlay box, drawn over each presented picture (not into screenshots of the game picture).
+ * bgra: w x h pixels, premultiplied alpha, sRGB, 8 bits a channel in B G R A byte order, rows bytes_per_row apart.
+ *       The pixels are copied before the call returns.
+ * x, y: the box's top-left corner in drawable pixels, from the drawable's top-left corner. A box that reaches past
+ *       the drawable is clipped; one wholly outside is not drawn.
+ * bgra NULL, or w or h not above 0: no overlay from now on.
+ * Any thread, including before the first present. Returns 1 when the request was taken (drawn from the next present
+ * on, or removed), 0 when it cannot be (w or h above 2048, bytes_per_row below 4 * w, or allocation failure).
+ */
+int mtl_front_overlay(const void *bgra, int w, int h, int bytes_per_row, int x, int y);
 /* frame_ticks: 60 Hz ticks one game frame occupies (the game's present interval; 1 in display mode). */
 int mtl_link_wait_tick(uint64_t timeout_ns, unsigned frame_ticks);
 double mtl_presented_time(uint64_t n);
