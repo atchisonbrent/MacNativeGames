@@ -11693,10 +11693,30 @@ static const uint8_t *bound_uniform_bytes(uint64_t gpu, size_t size, id<MTLBuffe
    OOT_RACE_CHECK, found 16-196 KB buffers written by the CPU before their submission completed; one frame's NaN then
    filled the whole screen through bloom). As with uniform blocks (usnap), the GPU reads the bytes the submit call
    saw: a copy in the submission's arena. A range with GPU writes not yet complete (this or an earlier submission) is
-   read live, so GPU-produced data is never replaced by a CPU copy. OOT_SBUF_SNAPSHOT=0 reads memory as before. */
+   read live, so GPU-produced data is never replaced by a CPU copy. OOT_SBUF_SNAPSHOT=0 reads memory as before.
+   Breath of the Wild has it on for its text only (2026-11-15; measured on 1.9.0, and a 1.6.0 build gets it only if it
+   has the same shader), unless OOT_SBUF_SNAPSHOT is set. The game draws a string as instanced quads with a read-only
+   storage array of 64 bytes a glyph (vertex shader 21fe759b8114941c). Under TOTK_SYNC_LAG, its default, the game's
+   wait for a submission settles for the one before, and the game then rewrites those arrays while the submission that
+   draws them is still on the GPU: in a run of thirteen openings of the pause menu at 2560x1440 and about 108 fps,
+   OOT_RACE_CHECK=1 reported 71 of them (64 to 6,336 bytes), written up to 4.9 ms (2.6 at the median) ms before the GPU was done. The report was text drawn all over the screen for a frame or two while a menu or a subtitle
+   fades. The copy is made when the draw is encoded, which for this game is inside the submit call; a copied range is
+   no longer read in place, so the race check no longer counts it, and a write by another game thread during the copy
+   itself is not excluded, nor is one between two draws of one submission, which would get the first copy. Only that
+   shader's arrays of up to 64 KB are copied. No GPU write to them was seen (no copy met a pending writer in 16,200
+   frames), and the cached copies and argument buffers are not checked against every GPU writer of a range, which
+   other read-only storage (also rewritten early, by shaders that have writable storage too) would need. It needs the
+   uniform copies (TOTK_UBO_SNAPSHOT), whose tables track the GPU's writes. In that run: 19 copies a frame, 0.6 KB
+   each. No test covers the three functions below. */
+#ifdef GAME_BOTW
+#define SBUF_SNAP_DEFAULT -1   /* the text shader only */
+#else
+#define SBUF_SNAP_DEFAULT 0
+#endif
 static uint64_t pool_range_write_fence(const p_bind_buf *u);
-static int sbuf_snap_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("OOT_SBUF_SNAPSHOT"); on = e ? atoi(e) : 0; } return on; }   // off by default; =1: ranges up to 256 KB; =<n> (n > 1): up to n KB (2026-11-09: 1024 covers the main scene's 720 KB block)
-static size_t sbuf_snap_limit(void) { int v = sbuf_snap_on(); return v > 1 ? (size_t)v << 10 : 262144; }
+static int sbuf_snap_on(void) { static int on = -2; if (on == -2) { const char *e = getenv("OOT_SBUF_SNAPSHOT"); on = e ? (atoi(e) > 0 ? atoi(e) : 0) : SBUF_SNAP_DEFAULT; } return on; }   // 0: off (the default except in Breath of the Wild); -1: Breath of the Wild's text shader only, up to 64 KB; =1: ranges up to 256 KB; =<n> (n > 1): up to n KB (2026-11-09: 1024 covers the main scene's 720 KB block)
+static int sbuf_snap_shader(const char *key) { int v = sbuf_snap_on(); return v >= 0 ? v : usnap_on() && key && !strncmp(key, "21fe759b8114941c", 16); }   // whether this shader's read-only storage ranges are copied
+static size_t sbuf_snap_limit(void) { int v = sbuf_snap_on(); return v > 1 ? (size_t)v << 10 : v < 0 ? 65536 : 262144; }
 typedef struct { uint64_t addr, size, sub, gpu; int npend; } sbuf_snap_ent;   // npend: pend entries at the copy; later entries of the same submission are checked for overlap (the table only grows within a submission)
 static sbuf_snap_ent g_sbuf_snap[256]; static uint64_t g_sbuf_snap_copies, g_sbuf_snap_hits, g_sbuf_snap_live, g_sbuf_snap_bytes;
 static uint64_t sbuf_snap_get(const p_bind_buf *u) {
@@ -13358,7 +13378,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
                 else if (upd_overlap_seq(u->addr, u->addr + (u->size ? u->size : 1))) { g_ren_late++; RED_ONCE(59, "存储缓冲 %#llx 在编码器打开后才发现与待写入的 uniform 更新重叠", (unsigned long long)u->addr); }
             }
             if (b->kind == NVN_RB_SBUFP && b->rw && u && u->addr) usnap_drop(u->addr, u->size ? u->size : 1);   // TOTK: the shader may write it: no stale uniform copy from here on
-            uint64_t sgpu = !ren && b->kind == NVN_RB_SBUFP && !b->rw && u && u->addr && u->size && sbuf_snap_on() ? sbuf_snap_get(u) : 0;   // OOT: a small read-only storage buffer as of the encode: the GPU reads no live memory, so no read-fence mark either
+            uint64_t sgpu = !ren && b->kind == NVN_RB_SBUFP && !b->rw && u && u->addr && u->size && sbuf_snap_shader(sh ? sh->key : NULL) ? sbuf_snap_get(u) : 0;   // OOT: a small read-only storage buffer as of the encode: the GPU reads no live memory, so no read-fence mark either
             if (b->kind == NVN_RB_SBUFP && u && u->addr && !sgpu) gpu_read_input(u->addr, u->size, sh ? sh->key : NULL, b->rw ? 'w' : 's');   // OOT_RACE_CHECK / OOT_GPU_READ_FENCE (GPU writes do not fault and are not counted)
             const usnap_t *usc = !ren && b->kind == NVN_RB_UBOP && u && u->addr && !usnap_skipped(u->size, 1) ? usnap_find(u->addr, u->size ? u->size : 1) : NULL;   // TOTK: compute uniforms as of the submit call
             if (ren) { slots[aid] = ren; USE(dummy_buf(), MTLResourceUsageRead); }
