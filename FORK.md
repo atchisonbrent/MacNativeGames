@@ -1,6 +1,6 @@
 # What this branch changes, and why
 
-Twelve changes to MacNativeGames `f9f7aa8` (upstream `main` of 2026-11-13), one commit each, nearly all in the Metal backend
+Thirteen changes to MacNativeGames `f9f7aa8` (upstream `main` of 2026-11-13), one commit each, nearly all in the Metal backend
 (`games/totk/third_party/d2r_gfx/gfx/nvn/`). They were made while running Tears of the Kingdom 1.4.3 and Breath of
 the Wild 1.9.0 on an M6 Mac mini connected to an LG G3 television (3840x2160, HDR, variable refresh from 40 to
 120 Hz), with the runtime hosted by a frontend that owns the window.
@@ -69,6 +69,24 @@ screen that changes.
   one is not specific to BOTW: it is on by default for TOTK's HDR too. Not tested with frame interpolation, or with
   an SDR picture in an `_sRGB` format (the path is there; nothing here produced one).
 
+- **The text's glyph arrays are read from copies** (`8fb95d07`). Dialogue and menu text was drawn all over the screen
+  for a frame or two while it faded in or out, at up to 120 fps. The game draws a string as instanced quads with a
+  read-only storage array of 64 bytes a glyph, which the GPU read in place from the game's memory. Under
+  `TOTK_SYNC_LAG`, the default for this game, the game's wait for a submission settles for the one before, and the
+  game rewrites those arrays for its next frame while the submission that draws them is still on the GPU.
+  - `OOT_RACE_CHECK=1` reported 71 such arrays in a run of thirteen openings of the pause menu at about 108 fps,
+    changed up to 4.9 ms before the GPU was done. With the copies it reports none: a copied array is no longer read
+    in place.
+  - The copies are the ones Ocarina of Time has (`OOT_SBUF_SNAPSHOT`), made by default for the text's vertex shader
+    alone and up to 64 KB: 19 copies of 0.6 KB a frame in that run, with the frame time unchanged (9.02 ms against
+    9.12). `OOT_SBUF_SNAPSHOT=0` switches them off, and a positive value copies every shader's ranges.
+  - One shader on purpose. Other read-only storage is rewritten early too (56 ranges reported in the run) and is
+    left alone, because the cached copies are not checked against every GPU writer of a range.
+  - A frame with the scattered text was never captured (36 sampled frames without the copies were clean), so the fix
+    rests on the reported writes and on what the shader draws. A write by another thread during the copy itself is
+    not excluded. Measured in one place in the open world and in the pause menu; dialogue was not driven.
+    `TOTK_SYNC_LAG=0` also ends the early writes but cost about a quarter of the frame rate there.
+
 ### Render targets the game reads back
 
 The game flushes some small render targets and reads them on the CPU. The flush waits for the GPU on the game's
@@ -118,7 +136,8 @@ Upstream `main` at `3edfb0b6` has eight slots and the 120-wait rule alone.
 ## How it was tested
 
 `make -C games/totk/third_party/d2r_gfx/gfx/nvn/tests run` passes at the head of the branch; it was run at most
-commits as they were made, not at every one. Cores of both games built from all twelve commits run on the M6. The
+commits as they were made, not at every one. Cores of both games built from the first twelve commits run on the M6, and a Breath of the Wild core built from all
+thirteen. The
 measurements come from scripted runs there, read from the runtime's log, and Breath of the Wild is played on that
 build in HDR.
 
@@ -129,4 +148,5 @@ BOTW HDR commit edits headers it shares, so longer TOTK play is still owed.
 ## How it was made
 
 The changes were written with Claude (Anthropic) and, for parts, GPT through Codex; the commits carry
-`Co-Authored-By`. They were cross-reviewed by other models (Gemini, DeepSeek, Kimi, GPT).
+`Co-Authored-By`. They were cross-reviewed by other models (Gemini, DeepSeek, Kimi, GPT); the thirteenth by three of them, without
+DeepSeek.
